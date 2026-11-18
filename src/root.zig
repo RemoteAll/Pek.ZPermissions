@@ -6,16 +6,27 @@
 pub const jwt = @import("jwt.zig");
 pub const claims = @import("claims.zig");
 pub const secret = @import("secret.zig");
+pub const session = @import("session.zig");
+pub const redis = @import("redis.zig");
+pub const redis_store = @import("redis_store.zig");
 
 pub const Builder = jwt.Builder;
 pub const Jwt = jwt.Jwt;
 pub const Options = jwt.Options;
 pub const Decoded = jwt.Decoded;
 pub const Claims = claims.Claims;
+pub const SessionStore = session.Store;
+pub const SessionKeeper = session.Keeper;
+pub const MemoryStore = session.MemoryStore;
+pub const RedisStore = redis_store.RedisStore;
+pub const CSharpMirror = redis_store.CSharpMirror;
 
 test {
     _ = jwt;
     _ = claims;
     _ = secret;
+    _ = session;
+    _ = redis;
+    _ = redis_store;
     _ = @import("jwt_test.zig");
 }

@@ -16,13 +16,17 @@
 - **验签按规范形态**：签名段必须是 URL 安全、无填充、无空白原文（补 `=` / 插空白 / 换标准字母表一律拒绝）——对齐 C# `enc(...).ToUrlBase64() == ts[2]` 字符串精确比较。
 - **算法固定 HS256**：不读 header 的 alg 决定算法（防 `alg=none`）；`strict_header_alg` 可选加固。三端算法交集只有 HS256（Rust 端同样只支持 HS256）。
 - **`now` 由调用方传入**：核心库不读隐式时钟（便于测试与跨端复现）；CLI 用 `std.Io.Clock.real.now(io)`。
+- **会话存储默认不启用**：JWT 无状态，不配 store 时重启不掉线；启用后语义对齐 Rust `session.rs`
+  （键 `{prefix}session:{sha256}`、`exp <= now` 失效、剩余不足一半才滑动续期），**存储不可用一律退回纯 JWT 放行**。
+- **C# 键空间镜像**（`CSharpMirror`）：`jwt:token:access:{token}` 等键与**毫秒**时间戳已对齐本地源码，
+  但**未在真实 Redis + 真实 C# 进程对拍过**（本机无 Redis）——改它必须同步更新 `docs/互操作契约.md` 第 7 节。
 - 中文 `.ps1` 必须 **UTF-8 with BOM**；PS 5.1 下外部命令后用 `$LASTEXITCODE` 判定，不写 `2>&1 |`。
 
 ## 构建与验证
 
 ```powershell
 zig build                                   # 出 CLI
-zig build test                              # 19 项单测（含 C#/Rust 黄金样本 + 字节级复现）
+zig build test                              # 33 项单测（JWT 互通 + 会话存储/Redis 协议 + C# 镜像格式）
 zig test src\root.zig                       # 直接跑测试，可看 "All N tests passed"
 zig fmt --check src build.zig               # 格式
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\regression.ps1   # 一键回归（= interop.ps1，5 项三语言对拍）
