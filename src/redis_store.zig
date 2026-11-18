@@ -450,7 +450,8 @@ pub const CSharpMirror = struct {
             if (parsed) |v| {
                 switch (v) {
                     .array => |items| {
-                        for (items) |item| {
+                        // Zig 0.17：`std.json.Value.array` 是 manager ArrayList，要取 `.items`
+                        for (items.items) |item| {
                             switch (item) {
                                 .string => |s| tokens.append(a, s) catch {},
                                 else => {},
@@ -568,4 +569,64 @@ test "csharp-mirror: 键前缀与 C# 源码一致" {
     try std.testing.expectEqualStrings("jwt:token:refresh:", CSharpMirror.RefreshKeyPrefix);
     try std.testing.expectEqualStrings("jwt:token:bind:", CSharpMirror.BindKeyPrefix);
     try std.testing.expectEqualStrings("jwt:user:tokens:", CSharpMirror.UserTokensPrefix);
+}
+
+// 真 Redis 往返（**连不上就 SKIP**，CI 无 Redis 也不会红）。
+//
+// 之前 `CSharpMirror` 只验证过「字符串拼得对」，从没碰过真 Redis。
+// 本用例覆盖：写入 → `EXISTS` 命中 → 取回并核对字段/毫秒单位 → 删除 → 不再命中。
+//
+// 用 db=15 隔离，避免污染业务库（默认 db 0）。
+test "csharp-mirror: 真 Redis 往返（127.0.0.1:6379 db=15，连不上则跳过）" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    const server = "127.0.0.1:6379";
+
+    var mirror = CSharpMirror.open(a, io, server, null, 15) catch |e| {
+        std.debug.print("[SKIP] 连不上 Redis {s}：{s}（跳过真 Redis 往返）\n", .{ server, @errorName(e) });
+        return;
+    };
+    defer mirror.deinit();
+
+    if (!mirror.ping()) {
+        std.debug.print("[SKIP] Redis {s} 未响应 PING\n", .{server});
+        return;
+    }
+
+    const ns = std.Io.Clock.real.now(io).nanoseconds;
+    const token = try std.fmt.allocPrint(a, "zperm-probe.{d}.sig", .{ns});
+    defer a.free(token);
+
+    const issued: i64 = @intCast(@divFloor(ns, @as(i96, std.time.ns_per_s)));
+    const expires = issued + 600;
+
+    try std.testing.expect(mirror.saveAccess(token, 42, issued, expires, "", 0));
+    defer _ = mirror.remove(token);
+
+    // ① EXISTS 命中（键 = `jwt:token:access:{token}`）
+    try std.testing.expect(mirror.exists(token));
+
+    // ② 取回并核对：字段名 PascalCase、毫秒单位、UId 正确
+    const raw = mirror.getValue(token) orelse {
+        std.debug.print("[FAIL] getValue 返回空\n", .{});
+        return error.MissingValue;
+    };
+    defer a.free(raw);
+    std.debug.print("[redis] {s} => {s}\n", .{ token, raw });
+
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"UId\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"AccessToken\":\"") != null);
+
+    const expires_ms = try std.fmt.allocPrint(a, "\"AccessTokenUtcExpires\":{d}", .{expires * 1000});
+    defer a.free(expires_ms);
+    try std.testing.expect(std.mem.indexOf(u8, raw, expires_ms) != null);
+
+    const start_ms = try std.fmt.allocPrint(a, "\"StartTime\":{d}", .{issued * 1000});
+    defer a.free(start_ms);
+    try std.testing.expect(std.mem.indexOf(u8, raw, start_ms) != null);
+
+    // ③ 删除后不再命中
+    try std.testing.expect(mirror.remove(token));
+    try std.testing.expect(!mirror.exists(token));
 }

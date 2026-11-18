@@ -24,6 +24,7 @@ const secret_mod = @import("secret.zig");
 const session_mod = @import("session.zig");
 const sqlite_store = @import("sqlite_store.zig");
 const model_guard = @import("model_guard.zig");
+const redis_store = @import("redis_store.zig");
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -51,6 +52,9 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, group, "session")) {
         return cmdSession(io, gpa, w, cmd, args.items[3..]);
+    }
+    if (std.mem.eql(u8, group, "redis")) {
+        return cmdRedis(io, gpa, w, cmd, args.items[3..]);
     }
     if (std.mem.eql(u8, group, "model")) {
         if (std.mem.eql(u8, cmd, "check")) return cmdModelCheck(gpa, w, args.items[3..]);
@@ -93,6 +97,12 @@ fn usage(w: *std.Io.Writer) !void {
         \\      # 可选：--model=Entity/Model.xml  --prefix=  --idle=<secs>  --max=<secs>
         \\
         \\  zperm model check [modelPath]     # 模型守卫（防代码↔Model.xml 漂移）
+        \\
+        \\  zperm redis ping <server> [--db=0] [--password=]
+        \\  zperm redis get  <server> <token> [--db=0]
+        \\  zperm redis del  <server> <token> [--db=0]
+        \\  zperm redis put  <server> <token> <uid> <issuedUnix> <expiresUnix> [--db=0] [--refresh=]
+        \\      # 键与值格式对齐 C# JsonWebTokenStore（jwt:token:access:{{token}} + 毫秒）
         \\
     , .{});
 }
@@ -271,6 +281,123 @@ fn renderJson(map: *const std.json.ObjectMap, buf: []u8) []const u8 {
     var fw = std.Io.Writer.fixed(buf);
     std.json.Stringify.value(std.json.Value{ .object = map.* }, .{}, &fw) catch return "{}";
     return fw.buffered();
+}
+
+/// `zperm redis ...`：C# 键空间镜像的读写（用于运维排障与 C# 双向对拍）。
+///
+/// 键与值格式完全对齐 C# `JsonWebTokenStore`（`jwt:token:access:{token}` + PascalCase JSON + 毫秒）。
+fn cmdRedis(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    cmd: []const u8,
+    params: []const []const u8,
+) !u8 {
+    var db: i32 = 0;
+    var password: ?[]const u8 = null;
+    var refresh: []const u8 = "";
+
+    var pos = std.ArrayList([]const u8).empty;
+    defer pos.deinit(gpa);
+
+    for (params) |p| {
+        if (!std.mem.startsWith(u8, p, "--")) {
+            try pos.append(gpa, p);
+            continue;
+        }
+        const kv = p[2..];
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse {
+            try w.print("ERROR=参数 {s} 需要 --key=value 形式\n", .{p});
+            return 2;
+        };
+        const k = kv[0..eq];
+        const v = kv[eq + 1 ..];
+        if (std.mem.eql(u8, k, "db")) {
+            db = std.fmt.parseInt(i32, v, 10) catch {
+                try w.print("ERROR=--db 需要整数，收到 {s}\n", .{v});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, k, "password")) {
+            password = v;
+        } else if (std.mem.eql(u8, k, "refresh")) {
+            refresh = v;
+        } else {
+            try w.print("ERROR=未知参数 --{s}\n", .{k});
+            return 2;
+        }
+    }
+
+    if (pos.items.len < 1) {
+        try w.print("ERROR=redis 需要 <server>（如 127.0.0.1:6379）\n", .{});
+        return 2;
+    }
+    const server = pos.items[0];
+
+    var mirror = redis_store.CSharpMirror.open(gpa, io, server, password, db) catch |e| {
+        try w.print(
+            "ERROR=连接 Redis 失败：{s}\n" ++
+                "SERVER={s}\nDB={d}\n" ++
+                "HINT=确认 redis-server 已启动、地址端口正确；有密码时传 --password=<pwd>\n",
+            .{ @errorName(e), server, db },
+        );
+        return 1;
+    };
+    defer mirror.deinit();
+
+    if (std.mem.eql(u8, cmd, "ping")) {
+        const ok = mirror.ping();
+        try w.print("PING={d}\nSERVER={s}\nDB={d}\n", .{ @intFromBool(ok), server, db });
+        return if (ok) 0 else 1;
+    }
+
+    if (std.mem.eql(u8, cmd, "get")) {
+        if (pos.items.len < 2) {
+            try w.print("ERROR=get 需要 <server> <token>\n", .{});
+            return 2;
+        }
+        const token = pos.items[1];
+        const value = mirror.getValue(token) orelse {
+            try w.print("EXISTS=0\nTOKEN={s}\nKEY={s}{s}\n", .{ token, redis_store.CSharpMirror.AccessKeyPrefix, token });
+            return 1;
+        };
+        defer gpa.free(value);
+        try w.print("EXISTS=1\nKEY={s}{s}\nVALUE={s}\n", .{ redis_store.CSharpMirror.AccessKeyPrefix, token, value });
+        return 0;
+    }
+
+    if (std.mem.eql(u8, cmd, "del")) {
+        if (pos.items.len < 2) {
+            try w.print("ERROR=del 需要 <server> <token>\n", .{});
+            return 2;
+        }
+        const ok = mirror.remove(pos.items[1]);
+        try w.print("REMOVED={d}\n", .{@intFromBool(ok)});
+        return if (ok) 0 else 1;
+    }
+
+    if (std.mem.eql(u8, cmd, "put")) {
+        if (pos.items.len < 5) {
+            try w.print("ERROR=put 需要 <server> <token> <uid> <issuedUnix> <expiresUnix>\n", .{});
+            return 2;
+        }
+        const uid = (try parseIntArg(w, "<uid>", pos.items[2])) orelse return 2;
+        const issued = (try parseIntArg(w, "<issuedUnix>", pos.items[3])) orelse return 2;
+        const expires = (try parseIntArg(w, "<expiresUnix>", pos.items[4])) orelse return 2;
+
+        const ok = mirror.saveAccess(
+            pos.items[1],
+            @intCast(uid),
+            issued,
+            expires,
+            refresh,
+            0,
+        );
+        try w.print("SAVED={d}\nKEY={s}{s}\n", .{ @intFromBool(ok), redis_store.CSharpMirror.AccessKeyPrefix, pos.items[1] });
+        return if (ok) 0 else 1;
+    }
+
+    try w.print("ERROR=未知 redis 子命令 {s}\n", .{cmd});
+    return 2;
 }
 
 /// `zperm session ...`：会话管理。全部落在 `session.Keeper` 上，CLI 不复制任何语义。

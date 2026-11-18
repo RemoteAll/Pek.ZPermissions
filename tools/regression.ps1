@@ -29,5 +29,11 @@ if ($code -eq 0) {
     if ($guardCode -ne 0) { $code = 1 }
 }
 
+# 第三步：C# 键空间镜像与真 Redis 的双向对拍（Redis 不可用时脚本自身 SKIP，不算失败）。
+if ($code -eq 0) {
+    & (Join-Path $PSScriptRoot 'redis_mirror_e2e.ps1') | Tee-Object -FilePath $report -Append
+    if ($LASTEXITCODE -ne 0) { $code = 1 }
+}
+
 Write-Host ("report: {0}" -f $report)
 exit $code
