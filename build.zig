@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     };
 
     // 库模块：其它 Zig 项目可通过 `b.dependency("pek_zpermissions", .{}).module("pek_zpermissions")` 引用
-    _ = b.addModule("pek_zpermissions", .{
+    const lib_module = b.addModule("pek_zpermissions", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -43,6 +43,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
+
+    // 示例：在**真实 HTTP 服务**上跑 http_auth 中间件（供 tools\http_guard_e2e.ps1 端到端验证）
+    const guard_demo = b.addExecutable(.{
+        .name = "http-guard-demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http_guard_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &imports,
+        }),
+    });
+    guard_demo.root_module.addImport("pek_zpermissions", lib_module);
+    b.installArtifact(guard_demo);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "运行单元测试（含 C# / Rust 互操作黄金样本）");

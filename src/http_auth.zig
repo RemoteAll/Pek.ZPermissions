@@ -167,7 +167,7 @@ fn denyResponse(c: *router.Ctx, d: Outcome.Deny) router.Response {
     const body = std.fmt.allocPrint(
         c.arena,
         "{{\"code\":{d},\"message\":\"{s}\"}}",
-        .{ @intFromEnum(d.status), d.reason },
+        .{ @backingInt(d.status), d.reason },
     ) catch "{\"code\":401,\"message\":\"Unauthorized\"}";
     return router.Response.jsonStatus(d.status, body);
 }
