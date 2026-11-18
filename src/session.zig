@@ -246,30 +246,37 @@ pub const Keeper = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return .invalid;
-        const obj = switch (parsed) {
-            .object => |m| m,
-            else => return .invalid,
-        };
+        // 用 zzig 的 jsmn（JsonDoc：**解析一次、多次取值**）。
+        // 旧实现走 `std.json.parseFromSliceLeaky`，实测 814 ns/次；
+        // jsmn 一次解析 257 ns，8 个字段共用这一次解析结果。
+        var doc = zzig.json.JsonDoc.init(a, text) catch return .invalid;
+        defer doc.deinit();
 
-        const exp = jsonInt(obj, "exp");
-        const abs = jsonInt(obj, "abs");
+        // 6 个整数键一次遍历取完（逐个 getInt 会从头遍历 6 遍）
+        var ints: [6]i64 = undefined;
+        doc.getIntsInto(&.{ "exp", "abs", "uid", "ver", "cver", "iat" }, &ints);
+
+        const exp = ints[0];
+        const abs = ints[1];
+        const uid = ints[2];
+        const ver = ints[3];
+        const cver = ints[4];
+        const iat = ints[5];
         if ((exp > 0 and exp <= now) or (abs > 0 and abs <= now)) {
             _ = store.del(key);
             return .invalid;
         }
 
-        const uid = jsonInt(obj, "uid");
-        const client = jsonStr(obj, "client");
-        const pwd_tag = jsonStr(obj, "pwd");
+        const client = docStr(doc, "client");
+        const pwd_tag = docStr(doc, "pwd");
 
         // 两级版本校验：全局（所有端）与按端，任一被踢即失效
         if (uid > 0) {
-            if (jsonInt(obj, "ver") != self.version(store, a, self.userVerKey(a, uid) orelse return .invalid, now)) {
+            if (ver != self.version(store, a, self.userVerKey(a, uid) orelse return .invalid, now)) {
                 _ = store.del(key);
                 return .invalid;
             }
-            if (jsonInt(obj, "cver") != self.version(store, a, self.clientVerKey(a, uid, client) orelse return .invalid, now)) {
+            if (cver != self.version(store, a, self.clientVerKey(a, uid, client) orelse return .invalid, now)) {
                 _ = store.del(key);
                 return .invalid;
             }
@@ -282,7 +289,7 @@ pub const Keeper = struct {
             const renewed = std.fmt.allocPrint(
                 a,
                 "{{\"uid\":{d},\"pwd\":\"{s}\",\"client\":\"{s}\",\"ver\":{d},\"cver\":{d},\"iat\":{d},\"abs\":{d},\"exp\":{d}}}",
-                .{ uid, escaped(a, pwd_tag) orelse return .untracked, escaped(a, client) orelse return .untracked, jsonInt(obj, "ver"), jsonInt(obj, "cver"), if (jsonInt(obj, "iat") > 0) jsonInt(obj, "iat") else now, abs, next },
+                .{ uid, escaped(a, pwd_tag) orelse return .untracked, escaped(a, client) orelse return .untracked, ver, cver, if (iat > 0) iat else now, abs, next },
             ) catch return .untracked;
             const ttl = @max(next - now, 1);
             _ = store.set(key, renewed, ttl, now);
@@ -363,23 +370,17 @@ pub const Keeper = struct {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const a = arena.allocator();
-            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch {
+            var doc = zzig.json.JsonDoc.init(a, text) catch {
                 _ = store.srem(index, key);
                 continue;
             };
-            const obj = switch (parsed) {
-                .object => |m| m,
-                else => {
-                    _ = store.srem(index, key);
-                    continue;
-                },
-            };
+            defer doc.deinit();
 
-            const client = alloc.dupe(u8, jsonStr(obj, "client")) catch continue;
+            const client = alloc.dupe(u8, docStr(doc, "client")) catch continue;
             out.append(alloc, .{
                 .client = client,
-                .iat = jsonInt(obj, "iat"),
-                .exp = jsonInt(obj, "exp"),
+                .iat = doc.getInt(i64, "iat") catch 0,
+                .exp = doc.getInt(i64, "exp") catch 0,
             }) catch {
                 alloc.free(client);
                 continue;
@@ -444,12 +445,9 @@ pub const Keeper = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return null;
-        const obj = switch (parsed) {
-            .object => |m| m,
-            else => return null,
-        };
-        const uid = jsonInt(obj, "uid");
+        var doc = zzig.json.JsonDoc.init(a, text) catch return null;
+        defer doc.deinit();
+        const uid = doc.getInt(i64, "uid") catch 0;
         return if (uid > 0) uid else null;
     }
 
@@ -467,22 +465,11 @@ pub const Keeper = struct {
     }
 };
 
-fn jsonInt(map: std.json.ObjectMap, name: []const u8) i64 {
-    const v = map.get(name) orelse return 0;
-    return switch (v) {
-        .integer => |i| i,
-        .float => |f| @intFromFloat(f),
-        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
-        else => 0,
-    };
-}
-
-fn jsonStr(map: std.json.ObjectMap, name: []const u8) []const u8 {
-    const v = map.get(name) orelse return "";
-    return switch (v) {
-        .string => |s| s,
-        else => "",
-    };
+/// 取字符串字段：优先零分配快路径（值里无转义时直接借用原文），
+/// 含转义时用请求 arena 解码；缺失/类型不符返回空串（与旧 `jsonStr` 行为一致）。
+fn docStr(doc: zzig.json.JsonDoc, key: []const u8) []const u8 {
+    if (doc.getStringRaw(key)) |raw| return raw else |_| {}
+    return doc.getStringAlloc(key) catch "";
 }
 
 /// JSON 字符串转义（只需处理 `\` 与 `"`；口令指纹/客户端标识都是 ASCII）。

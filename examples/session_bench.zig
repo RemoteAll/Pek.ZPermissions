@@ -15,8 +15,8 @@ const std = @import("std");
 const zperm = @import("pek_zpermissions");
 const zzig = @import("zzig");
 
-const N_KEY: usize = 500_000;
-const N_CHECK: usize = 200_000;
+const N_KEY: usize = 1_000_000;
+const N_CHECK: usize = 1_000_000;
 
 const TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiIsIm5hbWUiOiJwZXJrIn0.abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG";
 
@@ -187,6 +187,39 @@ pub fn main(init: std.process.Init) !u8 {
             const v1 = nowNs(io);
             std.mem.doNotOptimizeAway(s3);
             try w.print("BENCH JSON 解析单项      {d:>9.1} ns/op（std.json.parseFromSliceLeaky）\n", .{nsPerOp(v0, v1, N_CHECK)});
+
+            // ── ⑧ zzig jsmn 单次取值（含一次 token 化 + 一次分配）──
+            var s4: usize = 0;
+            const q0 = nowNs(io);
+            var m: usize = 0;
+            while (m < N_CHECK) : (m += 1) {
+                const v = zzig.json.JsonQuery.init(gpa, sample).getInt(i64, "exp") catch continue;
+                s4 +%= @intCast(v & 0xFF);
+            }
+            const q1 = nowNs(io);
+            std.mem.doNotOptimizeAway(s4);
+            try w.print("BENCH JSON jsmn 取1字段  {d:>9.1} ns/op（zzig JsonQuery，含一次 parse）\n", .{nsPerOp(q0, q1, N_CHECK)});
+
+            // ── ⑨ zzig jsmn 一次解析 + 一次遍历取全字段（Keeper.check 的真实路径）──
+            // JsonQuery 每个 get 都会重新 parse；JsonDoc 只 parse 一次，
+            // getIntsInto 把 6 个整数键合并成一次遍历。
+            var s5: i64 = 0;
+            var ints: [6]i64 = undefined;
+            const d0 = nowNs(io);
+            var n: usize = 0;
+            while (n < N_CHECK) : (n += 1) {
+                var doc = zzig.json.JsonDoc.init(gpa, sample) catch continue;
+                defer doc.deinit();
+                doc.getIntsInto(&.{ "exp", "abs", "uid", "ver", "cver", "iat" }, &ints);
+                var acc: i64 = 0;
+                for (ints) |v| acc +%= v;
+                acc +%= @intCast((doc.getStringRaw("client") catch @as([]const u8, "")).len);
+                acc +%= @intCast((doc.getStringRaw("pwd") catch @as([]const u8, "")).len);
+                s5 +%= acc;
+            }
+            const d1 = nowNs(io);
+            std.mem.doNotOptimizeAway(s5);
+            try w.print("BENCH JSON jsmn 全字段  {d:>9.1} ns/op（zzig JsonDoc：1 次解析+1 次遍历）\n", .{nsPerOp(d0, d1, N_CHECK)});
         }
     }
 
