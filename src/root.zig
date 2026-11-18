@@ -10,6 +10,8 @@ pub const secret = @import("secret.zig");
 pub const session = @import("session.zig");
 pub const sqlite_store = @import("sqlite_store.zig");
 pub const redis_store = @import("redis_store.zig");
+/// 模型守卫（防「代码 ↔ `Entity/Model.xml` 漂移」）
+pub const model_guard = @import("model_guard.zig");
 
 pub const Builder = jwt.Builder;
 pub const Jwt = jwt.Jwt;
@@ -34,5 +36,6 @@ test {
     _ = session;
     _ = sqlite_store;
     _ = redis_store;
+    _ = model_guard;
     _ = @import("jwt_test.zig");
 }

@@ -7,12 +7,23 @@
 //!   zperm jwt verify <secret> <token>
 //!   zperm jwt inspect <token>
 //!   zperm jwt selfcheck
+//!   zperm session list         <db> <uid>
+//!   zperm session check        <db> <token>
+//!   zperm session revoke       <db> <token>
+//!   zperm session revokeuser   <db> <uid>
+//!   zperm session revokeclient <db> <uid> <client>
+//!   zperm model check          [modelPath]
 //!
+//! 所有 session 子命令支持 `--model=<path>` / `--prefix=<keyPrefix>` / `--idle=<secs>` / `--max=<secs>`。
 //! 输出统一为 `KEY=VALUE` 行，便于 PowerShell / shell 解析。
+//! 退出码：0 = 成功/放行；1 = 业务失败（校验失败、会话无效等）；2 = 用法错误。
 
 const std = @import("std");
 const jwt = @import("jwt.zig");
 const secret_mod = @import("secret.zig");
+const session_mod = @import("session.zig");
+const sqlite_store = @import("sqlite_store.zig");
+const model_guard = @import("model_guard.zig");
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -35,13 +46,25 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
 
-    if (!std.mem.eql(u8, args.items[1], "jwt")) {
-        try w.print("ERROR=unknown group {s}\n", .{args.items[1]});
+    const group = args.items[1];
+    const cmd = args.items[2];
+
+    if (std.mem.eql(u8, group, "session")) {
+        return cmdSession(io, gpa, w, cmd, args.items[3..]);
+    }
+    if (std.mem.eql(u8, group, "model")) {
+        if (std.mem.eql(u8, cmd, "check")) return cmdModelCheck(gpa, w, args.items[3..]);
+        try w.print("ERROR=unknown command model {s}\n", .{cmd});
         try usage(w);
         return 2;
     }
 
-    const cmd = args.items[2];
+    if (!std.mem.eql(u8, group, "jwt")) {
+        try w.print("ERROR=unknown group {s}\n", .{group});
+        try usage(w);
+        return 2;
+    }
+
     if (std.mem.eql(u8, cmd, "gen")) return cmdGen(io, gpa, w, args.items[3..], false);
     if (std.mem.eql(u8, cmd, "genraw")) return cmdGen(io, gpa, w, args.items[3..], true);
     if (std.mem.eql(u8, cmd, "verify")) return cmdVerify(io, gpa, w, args.items[3..]);
@@ -61,6 +84,15 @@ fn usage(w: *std.Io.Writer) !void {
         \\  zperm jwt verify  <secret> <token>
         \\  zperm jwt inspect <token>
         \\  zperm jwt selfcheck
+        \\
+        \\  zperm session list         <db> <uid>
+        \\  zperm session check        <db> <token>
+        \\  zperm session revoke       <db> <token>
+        \\  zperm session revokeuser   <db> <uid>
+        \\  zperm session revokeclient <db> <uid> <client>
+        \\      # 可选：--model=Entity/Model.xml  --prefix=  --idle=<secs>  --max=<secs>
+        \\
+        \\  zperm model check [modelPath]     # 模型守卫（防代码↔Model.xml 漂移）
         \\
     , .{});
 }
@@ -239,6 +271,236 @@ fn renderJson(map: *const std.json.ObjectMap, buf: []u8) []const u8 {
     var fw = std.Io.Writer.fixed(buf);
     std.json.Stringify.value(std.json.Value{ .object = map.* }, .{}, &fw) catch return "{}";
     return fw.buffered();
+}
+
+/// `zperm session ...`：会话管理。全部落在 `session.Keeper` 上，CLI 不复制任何语义。
+fn cmdSession(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    cmd: []const u8,
+    params: []const []const u8,
+) !u8 {
+    var model_path: []const u8 = sqlite_store.DEFAULT_MODEL_PATH;
+    var prefix: []const u8 = "";
+    var policy = session_mod.Policy{};
+
+    var pos = std.ArrayList([]const u8).empty;
+    defer pos.deinit(gpa);
+
+    for (params) |p| {
+        if (!std.mem.startsWith(u8, p, "--")) {
+            try pos.append(gpa, p);
+            continue;
+        }
+        const kv = p[2..];
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse {
+            try w.print("ERROR=参数 {s} 需要 --key=value 形式\n", .{p});
+            return 2;
+        };
+        const k = kv[0..eq];
+        const v = kv[eq + 1 ..];
+        if (std.mem.eql(u8, k, "model")) {
+            model_path = v;
+        } else if (std.mem.eql(u8, k, "prefix")) {
+            prefix = v;
+        } else if (std.mem.eql(u8, k, "idle")) {
+            policy.idle_secs = std.fmt.parseInt(i64, v, 10) catch {
+                try w.print("ERROR=--idle 需要整数秒，收到 {s}\n", .{v});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, k, "max")) {
+            policy.max_secs = std.fmt.parseInt(i64, v, 10) catch {
+                try w.print("ERROR=--max 需要整数秒，收到 {s}\n", .{v});
+                return 2;
+            };
+        } else {
+            try w.print("ERROR=未知参数 --{s}\n", .{k});
+            return 2;
+        }
+    }
+
+    if (pos.items.len < 1) {
+        try w.print("ERROR=session 需要 <db>（Pek.ZCode 连接串，如 \"Data Source=Data\\sessions.db\"）\n", .{});
+        return 2;
+    }
+
+    const db = pos.items[0];
+    var st = sqlite_store.SqliteStore.open(gpa, db, model_path) catch |e| {
+        // 失败原因按「日志与错误信息规范」给全：做什么 + 为什么 + 关键上下文 + 下一步
+        try w.print(
+            "ERROR=打开会话库失败：{s}\n" ++
+                "DB={s}\n" ++
+                "MODEL={s}\n" ++
+                "HINT=常见原因：① 目录不存在（如 Data\\）→ 先创建该目录；" ++
+                "② SQLite 动态库不可用（sqlite3 库需在 exe 同目录或 PATH）；" ++
+                "③ 连接串格式应为 \"Data Source=<文件路径>;Provider=SQLite\"\n",
+            .{ @errorName(e), db, model_path },
+        );
+        return 1;
+    };
+    defer st.deinit();
+
+    const keeper = session_mod.Keeper.init(gpa, st.store(), prefix, policy);
+    const now = nowSeconds(io);
+
+    if (std.mem.eql(u8, cmd, "list")) return sessionList(gpa, w, &keeper, pos.items, now);
+    if (std.mem.eql(u8, cmd, "check")) return sessionCheck(gpa, w, &keeper, pos.items, now);
+    if (std.mem.eql(u8, cmd, "revoke")) return sessionRevoke(w, &keeper, pos.items, now);
+    if (std.mem.eql(u8, cmd, "revokeuser")) return sessionRevokeUser(w, &keeper, pos.items, now);
+    if (std.mem.eql(u8, cmd, "revokeclient")) return sessionRevokeClient(w, &keeper, pos.items, now);
+
+    try w.print("ERROR=未知 session 子命令 {s}\n", .{cmd});
+    return 2;
+}
+
+/// 解析位置参数里的整数；失败时已打印 ERROR，返回 null。
+fn parseIntArg(w: *std.Io.Writer, name: []const u8, raw: []const u8) !?i64 {
+    return std.fmt.parseInt(i64, raw, 10) catch {
+        try w.print("ERROR={s} 需要整数，收到 {s}\n", .{ name, raw });
+        return null;
+    };
+}
+
+fn sessionList(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    keeper: *const session_mod.Keeper,
+    pos: []const []const u8,
+    now: i64,
+) !u8 {
+    if (pos.len < 2) {
+        try w.print("ERROR=list 需要 <db> <uid>\n", .{});
+        return 2;
+    }
+    const uid = (try parseIntArg(w, "<uid>", pos[1])) orelse return 2;
+
+    try w.print("STORE={s}\nUID={d}\n", .{ keeper.storeKind(), uid });
+    const maybe = keeper.sessions(uid, now);
+    const items = maybe orelse {
+        try w.print("COUNT=0\nNOTE=存储不支持集合或当前不可用（SQLite/Redis 支持；纯 JWT 模式不支持）\n", .{});
+        return 1;
+    };
+    defer {
+        for (items) |it| it.deinit(gpa);
+        gpa.free(items);
+    }
+
+    try w.print("COUNT={d}\n", .{items.len});
+    for (items, 0..) |it, i| {
+        try w.print("SESSION.{d}.CLIENT={s}\n", .{ i, it.client });
+        try w.print("SESSION.{d}.IAT={d}\n", .{ i, it.iat });
+        try w.print("SESSION.{d}.EXP={d}\n", .{ i, it.exp });
+    }
+    return 0;
+}
+
+fn sessionCheck(
+    gpa: std.mem.Allocator,
+    w: *std.Io.Writer,
+    keeper: *const session_mod.Keeper,
+    pos: []const []const u8,
+    now: i64,
+) !u8 {
+    if (pos.len < 2) {
+        try w.print("ERROR=check 需要 <db> <token>\n", .{});
+        return 2;
+    }
+
+    try w.print("STORE={s}\n", .{keeper.storeKind()});
+    switch (keeper.check(pos[1], now)) {
+        .active => |a| {
+            defer a.deinit(gpa);
+            try w.print("STATE=active\nCLIENT={s}\nPWD={s}\nAUTHORIZE=1\n", .{ a.client, a.pwd_tag });
+            return 0;
+        },
+        .invalid => {
+            try w.print("STATE=invalid\nAUTHORIZE=0\n", .{});
+            return 1;
+        },
+        .untracked => {
+            try w.print("STATE=untracked\nAUTHORIZE=1\nNOTE=存储未配置或不可用，按纯 JWT 口径放行\n", .{});
+            return 0;
+        },
+    }
+}
+
+fn sessionRevoke(
+    w: *std.Io.Writer,
+    keeper: *const session_mod.Keeper,
+    pos: []const []const u8,
+    now: i64,
+) !u8 {
+    if (pos.len < 2) {
+        try w.print("ERROR=revoke 需要 <db> <token>\n", .{});
+        return 2;
+    }
+    const ok = keeper.revoke(pos[1], now);
+    try w.print("REVOKED={d}\n", .{@intFromBool(ok)});
+    return if (ok) 0 else 1;
+}
+
+fn sessionRevokeUser(
+    w: *std.Io.Writer,
+    keeper: *const session_mod.Keeper,
+    pos: []const []const u8,
+    now: i64,
+) !u8 {
+    if (pos.len < 2) {
+        try w.print("ERROR=revokeuser 需要 <db> <uid>\n", .{});
+        return 2;
+    }
+    const uid = (try parseIntArg(w, "<uid>", pos[1])) orelse return 2;
+    const ok = keeper.revokeUser(uid, now);
+    try w.print("UID={d}\nBUMPED={d}\n", .{ uid, @intFromBool(ok) });
+    return if (ok) 0 else 1;
+}
+
+fn sessionRevokeClient(
+    w: *std.Io.Writer,
+    keeper: *const session_mod.Keeper,
+    pos: []const []const u8,
+    now: i64,
+) !u8 {
+    if (pos.len < 3) {
+        try w.print("ERROR=revokeclient 需要 <db> <uid> <client>\n", .{});
+        return 2;
+    }
+    const uid = (try parseIntArg(w, "<uid>", pos[1])) orelse return 2;
+    const ok = keeper.revokeClient(uid, pos[2], now);
+    try w.print("UID={d}\nCLIENT={s}\nBUMPED={d}\n", .{ uid, pos[2], @intFromBool(ok) });
+    return if (ok) 0 else 1;
+}
+
+/// `zperm model check [modelPath]`：模型守卫，防止代码与 `Entity/Model.xml` 悄悄漂移。
+fn cmdModelCheck(gpa: std.mem.Allocator, w: *std.Io.Writer, params: []const []const u8) !u8 {
+    var model_path: []const u8 = sqlite_store.DEFAULT_MODEL_PATH;
+    for (params) |p| {
+        if (std.mem.startsWith(u8, p, "--model=")) {
+            model_path = p["--model=".len..];
+        } else if (!std.mem.startsWith(u8, p, "--")) {
+            model_path = p;
+        } else {
+            try w.print("ERROR=未知参数 {s}\n", .{p});
+            return 2;
+        }
+    }
+
+    var report = model_guard.check(gpa, model_path);
+    defer report.deinit();
+
+    try w.print("MODEL={s}\n", .{model_path});
+    try w.print("CONN={s}\n", .{report.conn_name orelse "-"});
+    try w.print("COLUMNS={d}\nINDEXES={d}\n", .{ report.columns, report.indexes });
+    for (report.problems[0..report.problem_count]) |p| {
+        try w.print("PROBLEM={s}\n", .{p});
+    }
+    if (!report.ok()) {
+        try w.print("CHECK=FAIL\n", .{});
+        return 1;
+    }
+    try w.print("CHECK=OK\n", .{});
+    return 0;
 }
 
 fn saturateAdd(a: i64, b: i64) i64 {
