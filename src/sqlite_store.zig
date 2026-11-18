@@ -8,14 +8,14 @@
 //!                                  v  dialect（SQLite provider）.createTableAlloc
 //!                             DDL 语句（类型/长度/自增/主键/索引 均由方言规则映射）
 //!                                  |
-//!                                  v  Dal.syncSchema（幂等增量）
+//!                                  v  Dal.syncSchemaFor（幂等增量，只建归属本连接的表）
 //!                             实际库表
 //! ```
 //!
 //! - XML 只是模型的**输入载体**，可以手写；
 //! - 建表实际取决于「**模型对象 + 方言规则**」：`String(512)` → `nvarchar(512)`、
 //!   `Int64` → `INTEGER`、`DateTime` → `datetime`（实测值，见下方测试）；
-//! - **禁止**手写 DDL、**禁止**运行时改模型；结构变更改模型后重跑 `syncSchema`
+//! - **禁止**手写 DDL、**禁止**运行时改模型；结构变更改模型后重跑 `syncSchemaFor`
 //!   （缺表建表 / 缺列补列 / 缺索引补索引）。
 //!
 //! 存储形态：单表 KV（`SessionKey` 唯一索引），集合能力用键编码 `{setKey}\x1f{member}` 模拟，
@@ -68,7 +68,10 @@ pub const SqliteStore = struct {
             return error.Open;
         };
         defer s.deinit();
-        _ = instance.dal.syncSchema(&s) catch {
+        // 只建「归属本库连接」的表：连接名取 Dal 实际生效值（模型级 `<Option><ConnName>`），
+        // `include_model_level = true` 处理没有表级 ConnName 的表（本仓库模型正是如此）。
+        // 多库模型里表级 ConnName 指向别的库时，这里不会去连那个库。
+        _ = instance.dal.syncSchemaFor(&s, instance.dal.connName(), true) catch {
             instance.dal.deinit();
             return error.Sync;
         };
@@ -334,10 +337,11 @@ test "sqlite: 建表按模型 + 方言规则生成（非照抄 XML）且幂等" 
     var s = try dal.openSession();
     defer s.deinit();
 
-    // 首次：建表 + 建唯一索引
-    const r1 = try dal.syncSchema(&s);
+    // 首次：建表 + 建唯一索引（走 `syncSchemaFor`：只建归属本连接的表）
+    const r1 = try dal.syncSchemaFor(&s, dal.connName(), true);
     try testing.expectEqual(@as(usize, 1), r1.tables_created);
     try testing.expectEqual(@as(usize, 1), r1.indexes_created);
+    try testing.expectEqual(@as(usize, 0), r1.tables_skipped);
 
     // 方言映射后的**实际**列类型（实测值；不是 Model.xml 里的 DataType 原文）
     const rows = try dal.queryAlloc(alloc, "PRAGMA table_info(" ++ TABLE ++ ")", &.{});
