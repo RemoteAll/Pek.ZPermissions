@@ -12,6 +12,8 @@ pub const sqlite_store = @import("sqlite_store.zig");
 pub const redis_store = @import("redis_store.zig");
 /// 模型守卫（防「代码 ↔ `Entity/Model.xml` 漂移」）
 pub const model_guard = @import("model_guard.zig");
+/// HTTP 鉴权中间件（接入 `zzig` 的 `web.App` / `router`）
+pub const http_auth = @import("http_auth.zig");
 
 pub const Builder = jwt.Builder;
 pub const Jwt = jwt.Jwt;
@@ -37,5 +39,6 @@ test {
     _ = sqlite_store;
     _ = redis_store;
     _ = model_guard;
+    _ = http_auth;
     _ = @import("jwt_test.zig");
 }
