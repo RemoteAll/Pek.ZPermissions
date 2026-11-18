@@ -1,9 +1,16 @@
 .{
     .name = .pek_zpermissions,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0x276c41b2689c5f0f,
-    .dependencies = .{},
+    .dependencies = .{
+        // ORM / SQLite：会话存储默认后端（模型驱动建表，不手写 DDL）
+        .zcode = .{ .path = "../Pek.ZCode" },
+        // Redis 客户端（对齐 C# DH.NRedis / Rust Pek.RRedis；不重复实现 RESP）
+        .pek_zredis = .{ .path = "../Pek.ZRedis" },
+        // Zig 侧公共基础库（Db.Value 等）
+        .zzig = .{ .path = "../zzig" },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

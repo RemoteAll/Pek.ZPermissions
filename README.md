@@ -76,42 +76,70 @@ zperm jwt selfcheck                              # 内置 C# 黄金样本自检
 
 ## 会话存储（重启不掉线）
 
-**先澄清一个事实**：JWT 本身无状态，**什么都不配的情况下服务重启不会让令牌失效**。
-只有在需要「登出立即失效 / 按端踢线 / 在线会话列表」时才需要一份外部记录 —— 那份记录若只放内存，
-重启就会丢，导致全站强制重登。本库把这份记录抽象成 `session.Store`，提供三种实现：
+**默认后端 = SQLite**（经 `Pek.ZCode` 的 `Dal` + 内嵌模型驱动建表，不手写 DDL）。
+**硬口径：任何存储问题都不能把用户挡在外面。**
 
-| 实现 | 重启后 | 多实例共享 | 依赖 |
+1. **不配存储**（`Keeper.store = null`）→ 纯 JWT：验签 + 过期即放行，重启**不掉线**；
+2. **存储挂了 / 读写失败** → `untracked` → **放行**；
+3. **快照/库文件损坏** → 标记存储不可用 → **放行**（宁可暂时失去吊销能力，也不要全站重新登录）。
+
+只有一种情况会拒绝：**存储可用且明确判为无效**（主动登出 / 过期 / 被踢线）。
+推荐直接用 `Keeper.authorize(token, now)`：
+
+```zig
+if (!keeper.authorize(token, now)) return; // 只有明确的登出/过期/踢线才拒绝
+```
+
+| 后端 | 重启后 | 多实例共享 | 说明 |
 |---|---|---|---|
-| `session.MemoryStore` | **丢失** | 否 | 无 |
-| `session.FileStore` | **保留** | 否（单实例） | 无（JSON 快照 + 原子替换） |
-| `redis_store.RedisStore` | **保留** | **是** | Redis（内置 RESP2 客户端） |
+| **`SqliteStore`（默认推荐）** | **保留** | 否（单机文件库） | 经 `Pek.ZCode` 建表；`ZPermissions_Session` 单表 KV |
+| `RedisStore` | **保留** | **是** | 复用 **`Pek.ZRedis`**（对齐 C# `DH.NRedis` / Rust `Pek.RRedis`） |
+| `FileStore` | 保留 | 否 | 零依赖 JSON 快照（无 ORM 依赖时可用） |
+| `MemoryStore` | **丢失** | 否 | **仅测试**：重启清空会被当成「已登出」 |
 
 ```zig
 const perms = @import("pek_zpermissions");
 
-// 文件后端：零依赖，单实例，重启不丢
-var fs = perms.session.FileStore.init(alloc, io, std.Io.Dir.cwd(), "sessions.json");
-defer fs.deinit();
-var keeper = perms.SessionKeeper.init(alloc, fs.store(), "app:", .{
+// 默认：SQLite（模型驱动建表，幂等）
+var st = try perms.SqliteStore.open(alloc, "Data Source=Data\\sessions.db");
+defer st.deinit();
+var keeper = perms.SessionKeeper.init(alloc, st.store(), "app:", .{
     .idle_secs = 7 * 24 * 3600,   // 空闲有效期（不足一半才滑动续期）
     .max_secs = 30 * 24 * 3600,   // 绝对上限（到点必须重新登录）
 });
 
-// Redis 后端：多实例共享（键 = {prefix}session:{sha256(token)}）
-var rs = perms.RedisStore.init(alloc, io, "127.0.0.1", 6379);
+// 多实例共享：Redis（复用 Pek.ZRedis）
+var rs = try perms.RedisStore.open(alloc, io, "127.0.0.1:6379", null, 0);
+defer rs.deinit();
 var keeper2 = perms.SessionKeeper.init(alloc, rs.store(), "app:", .{});
 
-// 登录成功后登记 / 请求时校验 / 登出 / 踢线
+// 登录后登记 / 请求时放行判断 / 登出 / 踢线
 keeper.register(token, uid, pwd_tag, "web", now);
-switch (keeper.check(token, now)) {
-    .active => |a| { defer a.deinit(alloc); /* 放行 */ },
-    .invalid => { /* 拒绝：已登出 / 过期 / 被踢 */ },
-    .untracked => { /* 存储不可用 → 按纯 JWT 放行（验签 + 过期） */ },
-}
-_ = keeper.revoke(token, now);          // 登出
-_ = keeper.revokeUser(uid, now);        // 踢掉该账号全部端
+if (!keeper.authorize(token, now)) return;
+_ = keeper.revoke(token, now);            // 登出
+_ = keeper.revokeUser(uid, now);          // 踢掉该账号全部端
 _ = keeper.revokeClient(uid, "web", now); // 只踢某一端
 ```
+
+> 注意：`:memory:` 连接串**不适用**于 `SqliteStore` —— `Dal` 每次操作使用独立连接，内存库不共享。
+
+**建表链路（不是「解析 XML 拼 SQL」）**：
+
+```
+Entity/Model.xml  --解析-->  EntityModel / TableMeta / ColumnMeta（模型对象）
+                                 |
+                                 v  dialect（SQLite provider）按方言规则生成 DDL
+                            String(512) → nvarchar(512)
+                            Int64       → INTEGER
+                            DateTime    → datetime
+                                 |
+                                 v  Dal.syncSchema（幂等：缺表建表/缺列补列/缺索引补索引）
+                            实际库表
+```
+
+模型 XML 只是**输入载体**（可以手写）；建表行为由「模型对象 + 方言规则」决定，并有测试锁定
+（`sqlite: 建表按模型 + 方言规则生成（非照抄 XML）且幂等`）。
+
 
 语义与 Rust `Pek.RPermissions::session` 逐项对齐：键前缀、JSON 字段、两级版本号踢线、滑动续期、绝对上限。
 **存储不可用一律退回纯 JWT 放行**，绝不因为缓存挂了把所有人挡在外面。

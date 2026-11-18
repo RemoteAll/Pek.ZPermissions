@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pek.ZPermissions 数据模型（模型是唯一真相源）
+
+  - 建表一律走 Pek.ZCode `Dal.syncSchema`（幂等：缺表建表 / 缺列补列 / 缺索引补索引），
+    **禁止**运行时改模型、**禁止**手写 DDL。
+  - 本表只存「会话登记 / 吊销」记录（键 = 令牌 SHA-256 等），**不存令牌原文**。
+    与 C# `Pek.Permissions.JsonWebTokenStore` 的 Redis 键空间镜像见
+    `src/redis_store.zig` 的 `CSharpMirror`（那部分走 Redis，不落本表）。
+  - 会话记录的 JSON 字段与 Rust `Pek.RPermissions::session` 一致：
+    {"uid","pwd","client","ver","cver","iat","abs","exp"}（时间为 Unix 秒）
+-->
+<EntityModel xmlns="https://newlifex.com/Model202509.xsd" Version="1.0">
+  <Option>
+    <ConnName>Permissions</ConnName>
+    <Output>Entity</Output>
+    <Namespace>Pek.ZPermissions</Namespace>
+  </Option>
+  <Tables>
+    <Table Name="ZSession" TableName="ZPermissions_Session" Description="JWT 会话记录">
+      <Columns>
+        <Column Name="Id" DataType="Int64" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="SessionKey" DataType="String" Length="512" Description="键（会话 / 版本号 / 集合成员）" />
+        <Column Name="SessionValue" DataType="String" Length="4096" Nullable="True" Description="值（记录 JSON 或空）" />
+        <Column Name="ExpireAt" DataType="Int64" Description="过期（Unix 秒；0 = 不过期）" />
+        <Column Name="CreateTime" DataType="DateTime" Nullable="True" Description="创建时间" />
+        <Column Name="UpdateTime" DataType="DateTime" Nullable="True" Description="更新时间" />
+      </Columns>
+      <Indexes>
+        <Index Columns="SessionKey" Unique="True" />
+      </Indexes>
+    </Table>
+  </Tables>
+</EntityModel>

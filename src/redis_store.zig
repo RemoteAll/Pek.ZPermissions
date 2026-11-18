@@ -1,65 +1,71 @@
-//! Redis 后端：一套 Redis，两种口径。
+//! Redis 后端（多实例共享）——**复用 `Pek.ZRedis`**（对齐 C# `DH.NRedis` / Rust `Pek.RRedis`），
+//! 本仓库不重复实现 RESP。
+//!
+//! 两套键空间，互不干扰，可同时启用：
 //!
 //! | 口径 | 键 | 值 | 谁读 |
 //! |---|---|---|---|
 //! | Rust `Pek.RPermissions::session` | `{prefix}session:{sha256(token)}` | `{"uid","pwd","client","ver","cver","iat","abs","exp"}` | Rust / Zig |
-//! | C# `Pek.Permissions.JsonWebTokenStore` | `jwt:token:access:{token}` + `jwt:token:bind:{refresh}` + `jwt:user:tokens:{uid}` | `JsonWebToken` 的 JSON（**毫秒**时间戳） | C# |
-//!
-//! 两种口径互不干扰（键空间不同），可**同时启用**：
-//! - [`RedisStore`] 让 Zig/Rust 侧「重启不丢 + 多实例共享 + 可登出/踢线」；
-//! - [`CSharpMirror`] 让 C# 侧（`ExistsToken` / `GetCompleteTokenInfo`）也能识别这些会话，
-//!   反之 C# 登出删掉 `jwt:token:access:*` 后，Zig 侧也能通过 `exists` 感知。
+//! | C# `Pek.Permissions.JsonWebTokenStore` | `jwt:token:access:{token}`、`jwt:token:bind:{refresh}`、`jwt:user:tokens:{uid}` | `JsonWebToken` 的 JSON（**毫秒**时间戳） | C# |
 //!
 //! C# 侧依据（已核实的本地源码）：
-//! - `JsonWebTokenStore.cs:279` `GetTokenKey => $"jwt:token:access:{token}"`
-//! - `JsonWebTokenStore.cs:273` `GetRefreshTokenKey => $"jwt:token:refresh:{token}"`
-//! - `JsonWebTokenStore.cs:285` `GetBindRefreshTokenKey => $"jwt:token:bind:{token}"`
-//! - `GetUserTokensKey => $"jwt:user:tokens:{userId}"`，且**Redis 模式下也是普通字符串**
-//!   （`AddUserTokenForRedis` 用 `_cache.Get<HashSet<String>>` + `_cache.Set(...)`，
-//!   落库是 JSON 数组，**不是** Redis SET 类型）
-//! - `Pek.Common\Security\JsonWebToken.cs` 字段：`UId` / `AccessToken` / `AccessTokenUtcExpires` /
-//!   `RefreshToken` / `RefreshUtcExpires` / `StartTime`；其中 `AccessTokenUtcExpires` 与 `StartTime`
-//!   都是**毫秒**时间戳（`ToJsGetTime()` / `UnixTime.ToTimestamp()` 默认含毫秒）
+//! - `JsonWebTokenStore.cs:273/279/285`：`jwt:token:refresh:` / `jwt:token:access:` / `jwt:token:bind:`
+//! - `GetUserTokensKey => $"jwt:user:tokens:{userId}"`，且 **Redis 模式下也是普通字符串**
+//!   （`AddUserTokenForRedis` 用 `Get<HashSet<String>>` + `Set(...)`，落库是 JSON 数组，**不是** Redis SET）
+//! - `Pek.Common\Security\JsonWebToken.cs`：`UId` / `AccessToken` / `AccessTokenUtcExpires` /
+//!   `RefreshToken` / `RefreshUtcExpires` / `StartTime`；后两者与 `StartTime` 均为**毫秒**
 //! - `JsonWebTokenStore.cs:190` `ExistsToken => _cache.ContainsKey(GetTokenKey(token))`（只判键存在）
-//!
-//! 注意：`JsonWebToken` 的值格式按上述字段名与单位构造；C# 侧反序列化（NewLife FastJson）字段名
-//! 大小写不敏感，故 PascalCase 一定可读。**未在真实 Redis + 真实 C# 进程上对拍过**（本机无 Redis），
-//! 首次接生产前请跑一次 `tools/redis-check.ps1` 对拍。
 
 const std = @import("std");
-const redis = @import("redis.zig");
+const zredis = @import("pek_zredis");
 const session = @import("session.zig");
 
 pub const Store = session.Store;
+
+/// 把一条命令发给 Redis 并返回原始回复；调用方负责 `v.deinit(gpa)`。
+fn exec(client: *zredis.Redis, args: []const []const u8) ?zredis.Value {
+    return client.execute(args) catch null;
+}
 
 // ---------- Rust 口径 ----------
 
 /// Rust 口径的 Redis 存储（键 `{prefix}session:{sha256}` + `{prefix}userver:*` + `{prefix}sessions:{uid}`）。
 pub const RedisStore = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
-    host: []const u8,
-    port: u16,
-    mutex: std.Thread.Mutex = .{},
+    client: zredis.Redis,
+    mutex: session.SpinLock = .{},
     /// 最近一次操作是否成功（失败后进入「不可用」→ Keeper 退回纯 JWT 放行）
     up: bool = true,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) RedisStore {
-        return .{ .allocator = allocator, .io = io, .host = host, .port = port };
+    /// 连接。`server` 用 Pek.ZRedis 的连接串口径（如 `127.0.0.1:6379`）。
+    pub fn open(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        server: []const u8,
+        password: ?[]const u8,
+        db: i32,
+    ) !RedisStore {
+        const client = try zredis.Redis.open(allocator, io, server, password, db);
+        return .{ .allocator = allocator, .client = client };
+    }
+
+    pub fn deinit(self: *RedisStore) void {
+        self.client.deinit();
+        self.* = undefined;
     }
 
     pub fn store(self: *RedisStore) Store {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    /// 主动探活（`PING`），用于启动自检。
+    /// 探活（`PING`）。
     pub fn ping(self: *RedisStore) bool {
-        var c = redis.Client.connect(self.allocator, self.io, self.host, self.port) catch {
+        var v = exec(&self.client, &.{"PING"}) orelse {
             self.setUp(false);
             return false;
         };
-        defer c.deinit();
-        const ok = c.ping();
+        defer v.deinit(self.allocator);
+        const ok = v != .err;
         self.setUp(ok);
         return ok;
     }
@@ -68,15 +74,6 @@ pub const RedisStore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.up = up;
-    }
-
-    fn connect(self: *RedisStore) ?redis.Client {
-        const c = redis.Client.connect(self.allocator, self.io, self.host, self.port) catch {
-            self.setUp(false);
-            return null;
-        };
-        self.setUp(true);
-        return c;
     }
 
     const vtable = Store.VTable{
@@ -97,92 +94,118 @@ pub const RedisStore = struct {
     }
 
     fn getFn(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, now: i64) ?[]u8 {
-        _ = allocator;
-        _ = now;
+        _ = now; // TTL 由 Redis 自己维护
         const self: *RedisStore = @ptrCast(@alignCast(ptr));
-        const c = self.connect() orelse return null;
-        var client = c;
-        defer client.deinit();
-        return client.get(key) catch {
-            self.setUp(false);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.up) return null;
+
+        var v = exec(&self.client, &.{ "GET", key }) orelse {
+            self.up = false;
             return null;
+        };
+        defer v.deinit(self.allocator);
+        return switch (v) {
+            .bulk => |b| allocator.dupe(u8, b) catch null,
+            else => null,
         };
     }
 
-    fn setFn(ptr: *anyopaque, key: []const u8, value: []const u8, ttl_secs: i64) bool {
+    fn setFn(ptr: *anyopaque, key: []const u8, value: []const u8, ttl_secs: i64, now: i64) bool {
+        _ = now;
         const self: *RedisStore = @ptrCast(@alignCast(ptr));
-        var c = self.connect() orelse return false;
-        defer c.deinit();
-        const ok = c.set(key, value, ttl_secs);
-        self.setUp(ok);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.up) return false;
+
+        var ttl_buf: [24]u8 = undefined;
+        const ok = if (ttl_secs > 0) blk: {
+            const ttl_text = std.fmt.bufPrint(&ttl_buf, "{d}", .{ttl_secs}) catch return false;
+            var v = exec(&self.client, &.{ "SET", key, value, "EX", ttl_text }) orelse break :blk false;
+            defer v.deinit(self.allocator);
+            break :blk v != .err;
+        } else blk: {
+            var v = exec(&self.client, &.{ "SET", key, value }) orelse break :blk false;
+            defer v.deinit(self.allocator);
+            break :blk v != .err;
+        };
+        self.up = ok;
         return ok;
     }
 
     fn delFn(ptr: *anyopaque, key: []const u8) bool {
         const self: *RedisStore = @ptrCast(@alignCast(ptr));
-        var c = self.connect() orelse return false;
-        defer c.deinit();
-        const ok = c.del(key);
-        self.setUp(true); // DEL 不存在也算命令成功
-        return ok;
-    }
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.up) return false;
 
-    fn saddFn(ptr: *anyopaque, key: []const u8, member: []const u8, ttl_secs: i64) bool {
-        const self: *RedisStore = @ptrCast(@alignCast(ptr));
-        var c = self.connect() orelse return false;
-        defer c.deinit();
-
-        var reply = c.cmd(&.{ "SADD", key, member }) catch {
-            self.setUp(false);
+        var v = exec(&self.client, &.{ "DEL", key }) orelse {
+            self.up = false;
             return false;
         };
-        reply.deinit(self.allocator);
-        const added = switch (reply) {
-            .int => |n| n >= 0,
-            else => false,
+        defer v.deinit(self.allocator);
+        return (v.asInt() orelse 0) > 0;
+    }
+
+    fn saddFn(ptr: *anyopaque, key: []const u8, member: []const u8, ttl_secs: i64, now: i64) bool {
+        _ = now;
+        const self: *RedisStore = @ptrCast(@alignCast(ptr));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.up) return false;
+
+        var v = exec(&self.client, &.{ "SADD", key, member }) orelse {
+            self.up = false;
+            return false;
         };
-        if (added and ttl_secs > 0) {
+        defer v.deinit(self.allocator);
+        if (v == .err) return false;
+
+        if (ttl_secs > 0) {
             var ttl_buf: [24]u8 = undefined;
-            const ttl_text = std.fmt.bufPrint(&ttl_buf, "{d}", .{ttl_secs}) catch return added;
-            var expire = c.cmd(&.{ "EXPIRE", key, ttl_text }) catch return added;
-            expire.deinit(self.allocator);
+            const ttl_text = std.fmt.bufPrint(&ttl_buf, "{d}", .{ttl_secs}) catch return true;
+            if (exec(&self.client, &.{ "EXPIRE", key, ttl_text })) |ev| {
+                var e = ev;
+                e.deinit(self.allocator);
+            }
         }
-        self.setUp(true);
-        return added;
+        return true;
     }
 
     fn sremFn(ptr: *anyopaque, key: []const u8, member: []const u8) bool {
         const self: *RedisStore = @ptrCast(@alignCast(ptr));
-        var c = self.connect() orelse return false;
-        defer c.deinit();
-        var reply = c.cmd(&.{ "SREM", key, member }) catch {
-            self.setUp(false);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.up) return false;
+
+        var v = exec(&self.client, &.{ "SREM", key, member }) orelse {
+            self.up = false;
             return false;
         };
-        reply.deinit(self.allocator);
-        self.setUp(true);
-        return switch (reply) {
-            .int => |n| n > 0,
-            else => false,
-        };
+        defer v.deinit(self.allocator);
+        return (v.asInt() orelse 0) > 0;
     }
 
     fn smembersFn(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) ?[][]u8 {
         const self: *RedisStore = @ptrCast(@alignCast(ptr));
-        var c = self.connect() orelse return null;
-        defer c.deinit();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.up) return null;
 
-        var reply = c.cmd(&.{ "SMEMBERS", key }) catch {
-            self.setUp(false);
+        var v = exec(&self.client, &.{ "SMEMBERS", key }) orelse {
+            self.up = false;
             return null;
         };
-        defer reply.deinit(self.allocator);
+        defer v.deinit(self.allocator);
 
         var out = std.ArrayList([]u8).empty;
-        switch (reply) {
-            .array => |items| {
+        switch (v) {
+            .array, .set => |items| {
                 for (items) |item| {
-                    const text = item.bulk orelse continue;
+                    const text = switch (item) {
+                        .bulk => |b| b,
+                        else => continue,
+                    };
                     const copy = allocator.dupe(u8, text) catch {
                         for (out.items) |m| allocator.free(m);
                         out.deinit(allocator);
@@ -198,38 +221,50 @@ pub const RedisStore = struct {
             },
             else => return null,
         }
-        self.setUp(true);
         return out.toOwnedSlice(allocator) catch null;
     }
 };
 
 // ---------- C# 口径 ----------
 
-/// C# `JsonWebTokenStore` 的键空间镜像（双写 / 双检）。
 pub const CSharpMirror = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
-    host: []const u8,
-    port: u16,
-
-    /// C# 侧时间戳单位：**毫秒**（`ToJsGetTime()` / `UnixTime.ToTimestamp()` 默认含毫秒）
-    pub const TimestampUnit = enum { millis, secs };
-
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) CSharpMirror {
-        return .{ .allocator = allocator, .io = io, .host = host, .port = port };
-    }
+    client: zredis.Redis,
+    mutex: session.SpinLock = .{},
 
     pub const AccessKeyPrefix = "jwt:token:access:";
     pub const BindKeyPrefix = "jwt:token:bind:";
     pub const RefreshKeyPrefix = "jwt:token:refresh:";
     pub const UserTokensPrefix = "jwt:user:tokens:";
 
-    /// 写入 C# 口径的访问令牌记录（对齐 `JsonWebTokenStore.SaveToken`）。
-    ///
-    /// - `access_expires_unix`：访问令牌到期时刻（Unix 秒；内部按毫秒写入）
-    /// - `refresh_token` / `refresh_expires_unix`：可空（空则按 C# 的空串/0 写入）
+    pub fn open(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        server: []const u8,
+        password: ?[]const u8,
+        db: i32,
+    ) !CSharpMirror {
+        const client = try zredis.Redis.open(allocator, io, server, password, db);
+        return .{ .allocator = allocator, .client = client };
+    }
+
+    pub fn deinit(self: *CSharpMirror) void {
+        self.client.deinit();
+        self.* = undefined;
+    }
+
+    pub const Record = struct {
+        uid: i32,
+        refresh_token: []u8,
+
+        pub fn deinit(self: Record, allocator: std.mem.Allocator) void {
+            allocator.free(self.refresh_token);
+        }
+    };
+
+    /// 写入访问令牌记录（对齐 C# `JsonWebTokenStore.SaveToken`）。
     pub fn saveAccess(
-        self: *const CSharpMirror,
+        self: *CSharpMirror,
         token: []const u8,
         uid: i32,
         issued_unix: i64,
@@ -237,8 +272,8 @@ pub const CSharpMirror = struct {
         refresh_token: []const u8,
         refresh_expires_unix: i64,
     ) bool {
-        var c = redis.Client.connect(self.allocator, self.io, self.host, self.port) catch return false;
-        defer c.deinit();
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         const value = buildAccessValue(
             self.allocator,
@@ -252,46 +287,63 @@ pub const CSharpMirror = struct {
         defer self.allocator.free(value);
 
         const ttl = @max(access_expires_unix - issued_unix, 1);
-        if (!c.set(try self.key(AccessKeyPrefix, token), value, ttl)) return false;
+        const access_key = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ AccessKeyPrefix, token }) catch return false;
+        defer self.allocator.free(access_key);
+
+        if (!self.setKey(access_key, value, ttl)) return false;
 
         if (refresh_token.len > 0) {
-            _ = c.set(self.key(BindKeyPrefix, refresh_token) catch return false, value, ttl);
+            const bind_key = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ BindKeyPrefix, refresh_token }) catch return false;
+            defer self.allocator.free(bind_key);
+            _ = self.setKey(bind_key, value, ttl);
         }
 
-        // 用户令牌关联：C# 在 Redis 模式下也是**普通字符串（JSON 数组）**
-        if (uid > 0) {
-            self.addUserToken(&c, uid, token, ttl + 3600);
-        }
+        if (uid > 0) self.mutateUserTokens(uid, token, .add, ttl + 3600);
         return true;
     }
 
     /// 对应 C# `ExistsToken`（只判键存在）。
-    pub fn exists(self: *const CSharpMirror, token: []const u8) bool {
-        var c = redis.Client.connect(self.allocator, self.io, self.host, self.port) catch return false;
-        defer c.deinit();
-        return c.exists(self.key(AccessKeyPrefix, token) catch return false);
+    pub fn exists(self: *CSharpMirror, token: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const key = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ AccessKeyPrefix, token }) catch return false;
+        defer self.allocator.free(key);
+
+        var v = exec(&self.client, &.{ "EXISTS", key }) orelse return false;
+        defer v.deinit(self.allocator);
+        return (v.asInt() orelse 0) > 0;
     }
 
-    /// 对应 C# `GetToken`（读原始 JSON 值，调用方 free）。
-    pub fn getValue(self: *const CSharpMirror, token: []const u8) ?[]u8 {
-        var c = redis.Client.connect(self.allocator, self.io, self.host, self.port) catch return null;
-        defer c.deinit();
-        return c.get(self.key(AccessKeyPrefix, token) catch return null) catch null;
+    /// 对应 C# `GetToken`（读原始 JSON，调用方 free）。
+    pub fn getValue(self: *CSharpMirror, token: []const u8) ?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const key = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ AccessKeyPrefix, token }) catch return null;
+        defer self.allocator.free(key);
+
+        var v = exec(&self.client, &.{ "GET", key }) orelse return null;
+        defer v.deinit(self.allocator);
+        return switch (v) {
+            .bulk => |b| self.allocator.dupe(u8, b) catch null,
+            else => null,
+        };
     }
 
     /// 对应 C# `RemoveToken`（删 access / bind，并从用户令牌数组移除）。
-    pub fn remove(self: *const CSharpMirror, token: []const u8) bool {
-        var c = redis.Client.connect(self.allocator, self.io, self.host, self.port) catch return false;
-        defer c.deinit();
+    pub fn remove(self: *CSharpMirror, token: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
-        const access_key = self.key(AccessKeyPrefix, token) catch return false;
+        const access_key = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ AccessKeyPrefix, token }) catch return false;
         defer self.allocator.free(access_key);
 
-        // 先读出来拿 UId / RefreshToken（与 C# `RemoveTokenInternal` 一致）
         var uid: i32 = 0;
         var refresh_token: []u8 = &.{};
-        const maybe = c.get(access_key) catch null;
-        if (maybe) |text| {
+        defer if (refresh_token.len > 0) self.allocator.free(refresh_token);
+
+        if (self.getValueLocked(access_key)) |text| {
             defer self.allocator.free(text);
             if (self.parseRecord(self.allocator, text)) |info| {
                 uid = info.uid;
@@ -301,39 +353,29 @@ pub const CSharpMirror = struct {
                 info.deinit(self.allocator);
             }
         }
-        defer if (refresh_token.len > 0) self.allocator.free(refresh_token);
 
-        _ = c.del(access_key);
+        _ = self.delKey(access_key);
+
         if (refresh_token.len > 0) {
-            const bind_key = self.key(BindKeyPrefix, refresh_token) catch return true;
+            const bind_key = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ BindKeyPrefix, refresh_token }) catch return true;
             defer self.allocator.free(bind_key);
-            _ = c.del(bind_key);
+            _ = self.delKey(bind_key);
         }
-        if (uid > 0) self.removeUserToken(&c, uid, token);
+        if (uid > 0) self.mutateUserTokens(uid, token, .remove, 0);
         return true;
     }
 
     /// 探活。
-    pub fn ping(self: *const CSharpMirror) bool {
-        var c = redis.Client.connect(self.allocator, self.io, self.host, self.port) catch return false;
-        defer c.deinit();
-        return c.ping();
+    pub fn ping(self: *CSharpMirror) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var v = exec(&self.client, &.{"PING"}) orelse return false;
+        defer v.deinit(self.allocator);
+        return v != .err;
     }
 
-    // ---------- 内部 ----------
-
-    pub const Record = struct {
-        uid: i32,
-        refresh_token: []u8,
-
-        pub fn deinit(self: Record, allocator: std.mem.Allocator) void {
-            allocator.free(self.refresh_token);
-        }
-    };
-
-    /// 解析 C# `JsonWebToken` 的 JSON（容错：字段缺失按 0/空处理）。
-    /// 返回的记录由调用方 `deinit`。
-    pub fn parseRecord(self: *const CSharpMirror, allocator: std.mem.Allocator, text: []const u8) ?Record {
+    /// 解析 C# `JsonWebToken` 的 JSON（容错：字段缺失按 0/空处理）。返回记录由调用方 `deinit`。
+    pub fn parseRecord(self: *CSharpMirror, allocator: std.mem.Allocator, text: []const u8) ?Record {
         _ = self;
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -364,23 +406,36 @@ pub const CSharpMirror = struct {
         return .{ .uid = uid, .refresh_token = allocator.dupe(u8, refresh) catch return null };
     }
 
-    fn key(self: *const CSharpMirror, prefix: []const u8, suffix: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ prefix, suffix });
+    // ---------- 内部（已持有锁） ----------
+
+    fn getValueLocked(self: *CSharpMirror, key: []const u8) ?[]u8 {
+        var v = exec(&self.client, &.{ "GET", key }) orelse return null;
+        defer v.deinit(self.allocator);
+        return switch (v) {
+            .bulk => |b| self.allocator.dupe(u8, b) catch null,
+            else => null,
+        };
     }
 
-    fn addUserToken(self: *const CSharpMirror, c: *redis.Client, uid: i32, token: []const u8, ttl: i64) void {
-        self.mutateUserTokens(c, uid, token, .add, ttl);
+    fn setKey(self: *CSharpMirror, key: []const u8, value: []const u8, ttl: i64) bool {
+        var ttl_buf: [24]u8 = undefined;
+        const ttl_text = std.fmt.bufPrint(&ttl_buf, "{d}", .{@max(ttl, 1)}) catch return false;
+        var v = exec(&self.client, &.{ "SET", key, value, "EX", ttl_text }) orelse return false;
+        defer v.deinit(self.allocator);
+        return v != .err;
     }
 
-    fn removeUserToken(self: *const CSharpMirror, c: *redis.Client, uid: i32, token: []const u8) void {
-        self.mutateUserTokens(c, uid, token, .remove, 0);
+    fn delKey(self: *CSharpMirror, key: []const u8) bool {
+        var v = exec(&self.client, &.{ "DEL", key }) orelse return false;
+        defer v.deinit(self.allocator);
+        return (v.asInt() orelse 0) > 0;
     }
 
     const Mode = enum { add, remove };
 
-    fn mutateUserTokens(self: *const CSharpMirror, c: *redis.Client, uid: i32, token: []const u8, mode: Mode, ttl: i64) void {
-        const user_tokens_key = std.fmt.allocPrint(self.allocator, "{s}{d}", .{ UserTokensPrefix, uid }) catch return;
-        defer self.allocator.free(user_tokens_key);
+    fn mutateUserTokens(self: *CSharpMirror, uid: i32, token: []const u8, mode: Mode, ttl: i64) void {
+        const key = std.fmt.allocPrint(self.allocator, "{s}{d}", .{ UserTokensPrefix, uid }) catch return;
+        defer self.allocator.free(key);
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -389,8 +444,7 @@ pub const CSharpMirror = struct {
         var tokens = std.ArrayList([]const u8).empty;
         defer tokens.deinit(a);
 
-        const maybe = c.get(user_tokens_key) catch null;
-        if (maybe) |text| {
+        if (self.getValueLocked(key)) |text| {
             defer self.allocator.free(text);
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch null;
             if (parsed) |v| {
@@ -429,13 +483,12 @@ pub const CSharpMirror = struct {
                     }
                 }
                 if (tokens.items.len == 0) {
-                    _ = c.del(user_tokens_key);
+                    _ = self.delKey(key);
                     return;
                 }
             },
         }
 
-        // 构造 JSON 数组（与 C# `HashSet<String>` 的 `ToJson()` 同形）
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.allocator);
         out.append(self.allocator, '[') catch return;
@@ -453,15 +506,15 @@ pub const CSharpMirror = struct {
         }
         out.append(self.allocator, ']') catch return;
 
-        _ = c.set(user_tokens_key, out.items, ttl);
+        _ = self.setKey(key, out.items, ttl);
     }
 };
 
 /// 构造 C# `JsonWebToken` 的记录值（对齐 `Pek.Common\Security\JsonWebToken.cs` 的字段与单位）。
 ///
-/// - 字段名用**属性名原样**（PascalCase）：NewLife 的 JSON 读取大小写不敏感，PascalCase 一定可读；
+/// - 字段名用**属性名原样**（PascalCase）：NewLife 的 JSON 读取大小写不敏感；
 /// - `AccessTokenUtcExpires` / `StartTime` 为**毫秒**（`ToJsGetTime()` / `UnixTime.ToTimestamp()` 默认含毫秒）；
-/// - `RefreshToken` 为空时写空串、`RefreshUtcExpires` 写 0（与 C# 的默认值一致）。
+/// - `RefreshToken` 为空时写空串、`RefreshUtcExpires` 写 0（与 C# 默认值一致）。
 pub fn buildAccessValue(
     allocator: std.mem.Allocator,
     token: []const u8,
@@ -485,7 +538,7 @@ pub fn buildAccessValue(
     ) catch null;
 }
 
-// ---------- 测试 ----------
+// ---------- 测试（不依赖真实 Redis） ----------
 
 test "csharp-mirror: 访问令牌记录格式（对齐 JsonWebToken 字段与毫秒单位）" {
     const allocator = std.testing.allocator;

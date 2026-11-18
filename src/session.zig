@@ -163,6 +163,23 @@ pub const Keeper = struct {
         return if (s.available()) "store" else "jwt";
     }
 
+    /// **默认放行语义**（推荐所有调用方用这个，而不是自己 switch）：
+    /// 只有「存储可用且明确判为无效（登出 / 过期 / 被踢）」才返回 `false`；
+    /// 纯 JWT 模式、存储不可用、读写失败一律返回 `true`。
+    ///
+    /// 这是本库的硬口径：**任何存储问题都不能把用户挡在外面**——
+    /// 没配存储重启不掉线、Redis/文件挂掉也不掉线，只有主动登出/踢线才失效。
+    pub fn authorize(self: *const Keeper, token: []const u8, now: i64) bool {
+        return switch (self.check(token, now)) {
+            .active => |a| blk: {
+                a.deinit(self.allocator);
+                break :blk true;
+            },
+            .invalid => false,
+            .untracked => true,
+        };
+    }
+
     /// 登录成功后登记（纯 JWT 模式返回 `false`）。
     pub fn register(
         self: *const Keeper,
@@ -731,17 +748,30 @@ pub const FileStore = struct {
     // ---------- 持久化 ----------
 
     fn load(self: *FileStore) void {
-        const data = self.dir.readFileAlloc(self.io, self.name, self.allocator, .limited(16 * 1024 * 1024)) catch return;
+        const data = self.dir.readFileAlloc(self.io, self.name, self.allocator, .limited(16 * 1024 * 1024)) catch |e| {
+            // 首次启动：文件不存在 → 正常的空存储
+            if (e == error.FileNotFound) return;
+            // 读不了（权限/磁盘）→ 退化放行，**绝不把所有人当成已登出**
+            self.up = false;
+            return;
+        };
         defer self.allocator.free(data);
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
 
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, data, .{}) catch return;
+        // 文件损坏同理：宁可放宽（纯 JWT），也不要让全站重启登录
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, data, .{}) catch {
+            self.up = false;
+            return;
+        };
         const root = switch (parsed) {
             .object => |m| m,
-            else => return,
+            else => {
+                self.up = false;
+                return;
+            },
         };
 
         if (root.get("entries")) |v| {
@@ -1208,4 +1238,50 @@ test "session: FileStore 重启后记录仍在（重启不用重新登录）" {
         const k = Keeper.init(alloc, store, "t:", POLICY);
         try expectActive(&k, TOKEN, 1002);
     }
+}
+
+test "session: authorize 默认全放行（不配存储 / 存储故障 / 文件损坏）" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+
+    // ① 不配存储：纯 JWT，重启也不掉线（默认口径）
+    const k_null = Keeper.init(alloc, null, "t:", POLICY);
+    try testing.expect(k_null.authorize(TOKEN, 1000));
+    try testing.expectEqualStrings("jwt", k_null.storeKind());
+
+    // ② 存储故障：按纯 JWT 放行（Redis 挂了不能把所有人挡在外面）
+    var mem = MemoryStore.init(alloc);
+    defer mem.deinit();
+    const k_mem = Keeper.init(alloc, mem.store(), "t:", POLICY);
+    try testing.expect(k_mem.register(TOKEN, 42, "", "web", 1000));
+    try testing.expect(k_mem.authorize(TOKEN, 1001));
+    mem.setUp(false);
+    try testing.expect(k_mem.authorize(TOKEN, 1002));
+
+    // ③ 快照文件损坏：退化为放行，而不是把所有人判成已登出
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "broken.json", .data = "{not-json" });
+
+    var fs = FileStore.init(alloc, io, tmp.dir, "broken.json");
+    defer fs.deinit();
+    try testing.expect(!fs.store().available());
+    const k_file = Keeper.init(alloc, fs.store(), "t:", POLICY);
+    try testing.expect(k_file.authorize(TOKEN, 1000));
+}
+
+test "session: authorize 只在明确失效时拒绝（登出 / 到期）" {
+    const alloc = testing.allocator;
+    var mem = MemoryStore.init(alloc);
+    defer mem.deinit();
+    const k = Keeper.init(alloc, mem.store(), "t:", POLICY);
+
+    try testing.expect(k.register(TOKEN, 42, "", "web", 1000));
+    try testing.expect(k.authorize(TOKEN, 1001));
+
+    try testing.expect(k.revoke(TOKEN, 1002));
+    try testing.expect(!k.authorize(TOKEN, 1003)); // 登出 → 拒绝
+
+    try testing.expect(k.register(TOKEN, 42, "", "web", 2000));
+    try testing.expect(!k.authorize(TOKEN, 2000 + 3600)); // 到期 → 拒绝
 }
