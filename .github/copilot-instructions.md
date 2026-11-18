@@ -29,7 +29,7 @@
 
 ```powershell
 zig build                                   # 出 CLI
-zig build test                              # 36 项单测（JWT 互通 + 会话存储/SQLite 建表/Redis 协议 + C# 镜像格式）
+zig build test                              # 37 项单测（JWT 互通 + 会话存储/SQLite 建表/Redis 协议 + C# 镜像格式）
 zig test src\root.zig                       # 直接跑测试，可看 "All N tests passed"
 zig fmt --check src build.zig               # 格式
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\regression.ps1   # 一键回归（= interop.ps1，5 项三语言对拍）

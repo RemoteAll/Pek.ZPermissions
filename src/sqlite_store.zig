@@ -375,6 +375,56 @@ fn columnText(r: zcode.session.Row, name: []const u8) []const u8 {
     };
 }
 
+test "sqlite: 启动时按需建表（表不存在才建；被删后重启自动重建）" {
+    const alloc = testing.allocator;
+    const io = std.testing.io;
+    const db_file = "zperm-sqlite-bootstrap-test.db";
+    defer std.Io.Dir.cwd().deleteFile(io, db_file) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, db_file ++ "-wal") catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, db_file ++ "-shm") catch {};
+
+    const conn = "Data Source=" ++ db_file;
+    const policy = session.Policy{ .idle_secs = 3600, .max_secs = 86400 };
+
+    // ① 首次启动：库文件为空 → 按模型 + 方言建表，可正常写入
+    {
+        var st = try SqliteStore.openDefault(alloc, conn);
+        defer st.deinit();
+        const k = session.Keeper.init(alloc, st.store(), "t:", policy);
+        try testing.expect(k.register("h.p.bootstrap", 1, "", "web", 1000));
+        try testing.expect(k.authorize("h.p.bootstrap", 1001));
+    }
+
+    // ② 模拟「库文件在、表不在」（首个部署常见形态）：删掉表
+    {
+        var st = try SqliteStore.openDefault(alloc, conn);
+        defer st.deinit();
+        _ = try st.dal.exec("DROP TABLE " ++ TABLE, &.{});
+    }
+
+    // ③ 再次启动：检测到表不存在 → 自动重建（不需要人工建表）
+    {
+        var st = try SqliteStore.openDefault(alloc, conn);
+        defer st.deinit();
+
+        const rows = try st.dal.queryAlloc(
+            alloc,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='" ++ TABLE ++ "'",
+            &.{},
+        );
+        defer zcode.session.freeRows(alloc, rows);
+        try testing.expectEqual(@as(usize, 1), rows.len);
+
+        // 重建后表可用（旧数据随 DROP 消失是预期的：仅为验证「按需建表」）
+        const s = st.store();
+        try testing.expect(s.set("t.after-rebuild", "v", 0, 1000));
+        if (s.get(alloc, "t.after-rebuild", 1001)) |v| {
+            defer alloc.free(v);
+            try testing.expectEqualStrings("v", v);
+        } else return error.ExpectedValue;
+    }
+}
+
 test "sqlite: 建表 + 读写 + 重启后记录仍在" {
     const alloc = testing.allocator;
     const io = std.testing.io;
