@@ -25,6 +25,7 @@ const session_mod = @import("session.zig");
 const sqlite_store = @import("sqlite_store.zig");
 const model_guard = @import("model_guard.zig");
 const redis_store = @import("redis_store.zig");
+const zcode = @import("zcode");
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -96,6 +97,8 @@ fn usage(w: *std.Io.Writer) !void {
         \\  zperm session revokeuser   <db> <uid>
         \\  zperm session revokeclient <db> <uid> <client>
         \\      # 可选：--model=Entity/Model.xml  --prefix=  --idle=<secs>  --max=<secs>
+        \\      # 只给连接名（未配置连接串时回退）：--conn=Permissions [--data=Data]
+        \\      #   生成 Data Source=Data/Permissions.db;Provider=SQLite;Migration=On（与 C# 一致）
         \\      # 走 Redis：--redis=127.0.0.1:6379 [--redisdb=0] [--password=]，此时**不需要** <db>
         \\      # register 专用：--client=<name>（默认 cli）  --pwd=<pwdTag>
         \\
@@ -420,6 +423,8 @@ fn cmdSession(
     var redis_server: ?[]const u8 = null;
     var redis_db: i32 = 0;
     var redis_password: ?[]const u8 = null;
+    var conn_name: ?[]const u8 = null;
+    var data_dir: []const u8 = "Data";
     var client_name: []const u8 = "cli";
     var pwd_tag: []const u8 = "";
 
@@ -444,6 +449,10 @@ fn cmdSession(
             prefix = v;
         } else if (std.mem.eql(u8, k, "redis")) {
             redis_server = v;
+        } else if (std.mem.eql(u8, k, "conn")) {
+            conn_name = v;
+        } else if (std.mem.eql(u8, k, "data")) {
+            data_dir = v;
         } else if (std.mem.eql(u8, k, "redisdb")) {
             redis_db = std.fmt.parseInt(i32, v, 10) catch {
                 try w.print("ERROR=--redisdb 需要整数，收到 {s}\n", .{v});
@@ -478,6 +487,7 @@ fn cmdSession(
     defer if (redis_holder) |*x| x.deinit();
 
     var store: session_mod.Store = undefined;
+    var db_from_pos = false;
 
     if (redis_server) |srv| {
         redis_holder = redis_store.RedisStore.open(gpa, io, srv, redis_password, redis_db) catch |e| {
@@ -494,15 +504,42 @@ fn cmdSession(
             try w.print("ERROR=Redis 无响应 PING\nSERVER={s}\n", .{srv});
             return 1;
         }
+    } else if (conn_name) |name| {
+        // 未配置连接串时的回退：按连接名生成默认 SQLite（与 C# `DAL.Init` 一致）。
+        // 连接名只允许字母数字与 - _ .，非法名这里的 error.InvalidConnName 会给出来。
+        const conn = zcode.defaultSqliteConnStr(gpa, name, data_dir) catch |e| {
+            try w.print(
+                "ERROR=连接名非法：{s}\nCONN={s}\n" ++
+                    "HINT=连接名只允许字母/数字/`-`/`_`/`.`（与 C# `_symbols` 口径一致）\n",
+                .{ @errorName(e), name },
+            );
+            return 2;
+        };
+        defer gpa.free(conn);
+
+        // 目录不存在时建好（C# 侧由 DataPath 保证；Zig 的 Dal 没有 io，只能这里做）
+        if (data_dir.len > 0) std.Io.Dir.cwd().createDirPath(io, data_dir) catch {};
+
+        try w.print("CONN={s}\nCONNSTR={s}\n", .{ name, conn });
+        sqlite_holder = sqlite_store.SqliteStore.open(gpa, conn, model_path) catch |e| {
+            try w.print(
+                "ERROR=打开会话库失败：{s}\nCONNSTR={s}\nMODEL={s}\n",
+                .{ @errorName(e), conn, model_path },
+            );
+            return 1;
+        };
+        store = sqlite_holder.?.store();
     } else {
         if (pos.items.len < 1) {
             try w.print(
                 "ERROR=session 需要 <db>（Pek.ZCode 连接串，如 \"Data Source=Data\\sessions.db\"）\n" ++
-                    "      或改用 --redis=127.0.0.1:6379 [--redisdb=0]\n",
+                    "      或 --conn=<连接名>（未配置即回退 Data/<连接名>.db，与 C# 一致）\n" ++
+                    "      或 --redis=127.0.0.1:6379 [--redisdb=0]\n",
                 .{},
             );
             return 2;
         }
+        db_from_pos = true;
         const db = pos.items[0];
         sqlite_holder = sqlite_store.SqliteStore.open(gpa, db, model_path) catch |e| {
             // 失败原因按「日志与错误信息规范」给全：做什么 + 为什么 + 关键上下文 + 下一步
@@ -510,7 +547,7 @@ fn cmdSession(
                 "ERROR=打开会话库失败：{s}\n" ++
                     "DB={s}\n" ++
                     "MODEL={s}\n" ++
-                    "HINT=常见原因：① 目录不存在（如 Data\\）→ 先创建该目录；" ++
+                    "HINT=常见原因：① 目录不存在（如 Data\\）→ 先创建该目录，或用 --conn=<连接名> 自动建；" ++
                     "② SQLite 动态库不可用（sqlite3 库需在 exe 同目录或 PATH）；" ++
                     "③ 连接串格式应为 \"Data Source=<文件路径>;Provider=SQLite\"\n",
                 .{ @errorName(e), db, model_path },
@@ -520,9 +557,9 @@ fn cmdSession(
         store = sqlite_holder.?.store();
     }
 
-    // 统一口径：SQLite 模式的第一个位置参数是库连接串，消费掉它；
+    // 统一口径：只有「显式连接串」模式的第一个位置参数是库连接串，消费掉它；
     // 之后 `pos.items[0]` 一律是子命令的第一个业务参数（token / uid …）。
-    if (redis_server == null and pos.items.len > 0) {
+    if (db_from_pos and pos.items.len > 0) {
         _ = pos.orderedRemove(0);
     }
 

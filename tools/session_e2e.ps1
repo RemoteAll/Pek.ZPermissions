@@ -99,6 +99,26 @@ try {
     $r = Invoke-External -Exe $zpermExe -Arguments @('session', 'check', $conn, $token)
     Assert-Case -Name 'SQLite 踢线后 check（应 invalid）' -Ok ($r.Output -like '*STATE=invalid*' -and $r.Output -like '*AUTHORIZE=0*') -Detail $r.Output.Trim()
 
+    # ── 连接名回退（--conn，对齐 C# `DAL.Init`：未配置连接串即用 Data/{名}.db）──
+    $dataDir = Join-Path $env:TEMP ("zperm-conn-$stamp")
+    $connToken = "e2e-conn-$stamp"
+    try {
+        $r = Invoke-External -Exe $zpermExe -Arguments @('session', 'register', $connToken, "$uid", '--conn=Permissions', "--data=$dataDir", '--client=cfgall')
+        $okConn = ($r.Output -like '*REGISTERED=1*') -and ($r.Output -like "*Data Source=$dataDir/Permissions.db*")
+        Assert-Case -Name '--conn 回退生成默认 SQLite 连接串' -Ok $okConn -Detail (($r.Output -split "`r?`n" | Where-Object { $_ -like 'CONNSTR=*' }) -join ' ')
+        Assert-Case -Name '--conn 自动创建数据目录与库文件' -Ok (Test-Path (Join-Path $dataDir 'Permissions.db')) -Detail $dataDir
+
+        $r = Invoke-External -Exe $zpermExe -Arguments @('session', 'check', $connToken, '--conn=Permissions', "--data=$dataDir")
+        Assert-Case -Name '--conn 模式下 check 为 active' -Ok ($r.Output -like '*STATE=active*') -Detail $r.Output.Trim()
+
+        # 非法连接名（含空格）必须被拒绝，且给出与 C# 一致的口径提示。
+        # 断言用英文 error 名：exe 输出 UTF-8，而 PS 5.1 按 GBK 解码中文会变乱码。
+        $r = Invoke-External -Exe $zpermExe -Arguments @('session', 'list', '1', '--conn=bad name', "--data=$dataDir")
+        Assert-Case -Name '非法连接名被拒绝' -Ok ($r.Output -like '*InvalidConnName*' -and $r.Code -eq 2) -Detail ("code={0}" -f $r.Code)
+    } finally {
+        Remove-Item $dataDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # 护栏：无效连接串必须正常报错，不能段错误（Pek.ZCode 双重释放 bug 的回归用例）
     $r = Invoke-External -Exe $zpermExe -Arguments @('session', 'list', 'not-a-conn-string', '1')
     $noCrash = ($r.Output -notlike '*Segmentation*')
