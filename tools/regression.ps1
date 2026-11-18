@@ -35,5 +35,12 @@ if ($code -eq 0) {
     if ($LASTEXITCODE -ne 0) { $code = 1 }
 }
 
+# 第四步：会话后端端到端（SQLite + Redis 的 register/check/revoke 全链路），
+# 并守住「无效连接串必须正常报错、不能段错误」这条已修 bug 的护栏。
+if ($code -eq 0) {
+    & (Join-Path $PSScriptRoot 'session_e2e.ps1') | Tee-Object -FilePath $report -Append
+    if ($LASTEXITCODE -ne 0) { $code = 1 }
+}
+
 Write-Host ("report: {0}" -f $report)
 exit $code

@@ -89,12 +89,15 @@ fn usage(w: *std.Io.Writer) !void {
         \\  zperm jwt inspect <token>
         \\  zperm jwt selfcheck
         \\
+        \\  zperm session register     <db> <token> <uid>      # 登记会话（等价登录成功后的 register）
         \\  zperm session list         <db> <uid>
         \\  zperm session check        <db> <token>
         \\  zperm session revoke       <db> <token>
         \\  zperm session revokeuser   <db> <uid>
         \\  zperm session revokeclient <db> <uid> <client>
         \\      # 可选：--model=Entity/Model.xml  --prefix=  --idle=<secs>  --max=<secs>
+        \\      # 走 Redis：--redis=127.0.0.1:6379 [--redisdb=0] [--password=]，此时**不需要** <db>
+        \\      # register 专用：--client=<name>（默认 cli）  --pwd=<pwdTag>
         \\
         \\  zperm model check [modelPath]     # 模型守卫（防代码↔Model.xml 漂移）
         \\
@@ -401,6 +404,9 @@ fn cmdRedis(
 }
 
 /// `zperm session ...`：会话管理。全部落在 `session.Keeper` 上，CLI 不复制任何语义。
+///
+/// 后端二选一：默认 SQLite（第一个位置参数为 Pek.ZCode 连接串）；
+/// 传 `--redis=<server>` 则走 Redis（此时**不需要** `<db>` 位置参数）。
 fn cmdSession(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -411,6 +417,11 @@ fn cmdSession(
     var model_path: []const u8 = sqlite_store.DEFAULT_MODEL_PATH;
     var prefix: []const u8 = "";
     var policy = session_mod.Policy{};
+    var redis_server: ?[]const u8 = null;
+    var redis_db: i32 = 0;
+    var redis_password: ?[]const u8 = null;
+    var client_name: []const u8 = "cli";
+    var pwd_tag: []const u8 = "";
 
     var pos = std.ArrayList([]const u8).empty;
     defer pos.deinit(gpa);
@@ -431,6 +442,19 @@ fn cmdSession(
             model_path = v;
         } else if (std.mem.eql(u8, k, "prefix")) {
             prefix = v;
+        } else if (std.mem.eql(u8, k, "redis")) {
+            redis_server = v;
+        } else if (std.mem.eql(u8, k, "redisdb")) {
+            redis_db = std.fmt.parseInt(i32, v, 10) catch {
+                try w.print("ERROR=--redisdb 需要整数，收到 {s}\n", .{v});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, k, "password")) {
+            redis_password = v;
+        } else if (std.mem.eql(u8, k, "client")) {
+            client_name = v;
+        } else if (std.mem.eql(u8, k, "pwd")) {
+            pwd_tag = v;
         } else if (std.mem.eql(u8, k, "idle")) {
             policy.idle_secs = std.fmt.parseInt(i64, v, 10) catch {
                 try w.print("ERROR=--idle 需要整数秒，收到 {s}\n", .{v});
@@ -447,30 +471,67 @@ fn cmdSession(
         }
     }
 
-    if (pos.items.len < 1) {
-        try w.print("ERROR=session 需要 <db>（Pek.ZCode 连接串，如 \"Data Source=Data\\sessions.db\"）\n", .{});
-        return 2;
+    // 两个后端各持有一份实例（`Store` 里的 ptr 指向它，生命周期必须覆盖后续所有调用）
+    var sqlite_holder: ?sqlite_store.SqliteStore = null;
+    defer if (sqlite_holder) |*x| x.deinit();
+    var redis_holder: ?redis_store.RedisStore = null;
+    defer if (redis_holder) |*x| x.deinit();
+
+    var store: session_mod.Store = undefined;
+
+    if (redis_server) |srv| {
+        redis_holder = redis_store.RedisStore.open(gpa, io, srv, redis_password, redis_db) catch |e| {
+            try w.print(
+                "ERROR=连接 Redis 失败：{s}\n" ++
+                    "SERVER={s}\nDB={d}\n" ++
+                    "HINT=确认 redis-server 已启动、地址端口正确；有密码时传 --password=<pwd>\n",
+                .{ @errorName(e), srv, redis_db },
+            );
+            return 1;
+        };
+        store = redis_holder.?.store();
+        if (!redis_holder.?.ping()) {
+            try w.print("ERROR=Redis 无响应 PING\nSERVER={s}\n", .{srv});
+            return 1;
+        }
+    } else {
+        if (pos.items.len < 1) {
+            try w.print(
+                "ERROR=session 需要 <db>（Pek.ZCode 连接串，如 \"Data Source=Data\\sessions.db\"）\n" ++
+                    "      或改用 --redis=127.0.0.1:6379 [--redisdb=0]\n",
+                .{},
+            );
+            return 2;
+        }
+        const db = pos.items[0];
+        sqlite_holder = sqlite_store.SqliteStore.open(gpa, db, model_path) catch |e| {
+            // 失败原因按「日志与错误信息规范」给全：做什么 + 为什么 + 关键上下文 + 下一步
+            try w.print(
+                "ERROR=打开会话库失败：{s}\n" ++
+                    "DB={s}\n" ++
+                    "MODEL={s}\n" ++
+                    "HINT=常见原因：① 目录不存在（如 Data\\）→ 先创建该目录；" ++
+                    "② SQLite 动态库不可用（sqlite3 库需在 exe 同目录或 PATH）；" ++
+                    "③ 连接串格式应为 \"Data Source=<文件路径>;Provider=SQLite\"\n",
+                .{ @errorName(e), db, model_path },
+            );
+            return 1;
+        };
+        store = sqlite_holder.?.store();
     }
 
-    const db = pos.items[0];
-    var st = sqlite_store.SqliteStore.open(gpa, db, model_path) catch |e| {
-        // 失败原因按「日志与错误信息规范」给全：做什么 + 为什么 + 关键上下文 + 下一步
-        try w.print(
-            "ERROR=打开会话库失败：{s}\n" ++
-                "DB={s}\n" ++
-                "MODEL={s}\n" ++
-                "HINT=常见原因：① 目录不存在（如 Data\\）→ 先创建该目录；" ++
-                "② SQLite 动态库不可用（sqlite3 库需在 exe 同目录或 PATH）；" ++
-                "③ 连接串格式应为 \"Data Source=<文件路径>;Provider=SQLite\"\n",
-            .{ @errorName(e), db, model_path },
-        );
-        return 1;
-    };
-    defer st.deinit();
+    // 统一口径：SQLite 模式的第一个位置参数是库连接串，消费掉它；
+    // 之后 `pos.items[0]` 一律是子命令的第一个业务参数（token / uid …）。
+    if (redis_server == null and pos.items.len > 0) {
+        _ = pos.orderedRemove(0);
+    }
 
-    const keeper = session_mod.Keeper.init(gpa, st.store(), prefix, policy);
+    const keeper = session_mod.Keeper.init(gpa, store, prefix, policy);
     const now = nowSeconds(io);
 
+    if (std.mem.eql(u8, cmd, "register")) {
+        return sessionRegister(w, &keeper, pos.items, client_name, pwd_tag, now);
+    }
     if (std.mem.eql(u8, cmd, "list")) return sessionList(gpa, w, &keeper, pos.items, now);
     if (std.mem.eql(u8, cmd, "check")) return sessionCheck(gpa, w, &keeper, pos.items, now);
     if (std.mem.eql(u8, cmd, "revoke")) return sessionRevoke(w, &keeper, pos.items, now);
@@ -489,6 +550,31 @@ fn parseIntArg(w: *std.Io.Writer, name: []const u8, raw: []const u8) !?i64 {
     };
 }
 
+/// 登记会话（相当于登录成功后调 `Keeper.register`）。
+/// 之前 CLI 没有这个入口，导致 Redis/SQLite 会话后端无法端到端验证。
+fn sessionRegister(
+    w: *std.Io.Writer,
+    keeper: *const session_mod.Keeper,
+    pos: []const []const u8,
+    client: []const u8,
+    pwd_tag: []const u8,
+    now: i64,
+) !u8 {
+    if (pos.len < 2) {
+        try w.print("ERROR=register 需要 <token> <uid>（SQLite 模式下前面还有 <db>）\n", .{});
+        return 2;
+    }
+    const token = pos[0];
+    const uid = (try parseIntArg(w, "<uid>", pos[1])) orelse return 2;
+
+    const ok = keeper.register(token, uid, pwd_tag, client, now);
+    try w.print(
+        "REGISTERED={d}\nSTORE={s}\nUID={d}\nCLIENT={s}\n",
+        .{ @intFromBool(ok), keeper.storeKind(), uid, client },
+    );
+    return if (ok) 0 else 1;
+}
+
 fn sessionList(
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -496,11 +582,11 @@ fn sessionList(
     pos: []const []const u8,
     now: i64,
 ) !u8 {
-    if (pos.len < 2) {
-        try w.print("ERROR=list 需要 <db> <uid>\n", .{});
+    if (pos.len < 1) {
+        try w.print("ERROR=list 需要 <uid>（SQLite 模式下前面还有 <db>）\n", .{});
         return 2;
     }
-    const uid = (try parseIntArg(w, "<uid>", pos[1])) orelse return 2;
+    const uid = (try parseIntArg(w, "<uid>", pos[0])) orelse return 2;
 
     try w.print("STORE={s}\nUID={d}\n", .{ keeper.storeKind(), uid });
     const maybe = keeper.sessions(uid, now);
@@ -529,13 +615,13 @@ fn sessionCheck(
     pos: []const []const u8,
     now: i64,
 ) !u8 {
-    if (pos.len < 2) {
-        try w.print("ERROR=check 需要 <db> <token>\n", .{});
+    if (pos.len < 1) {
+        try w.print("ERROR=check 需要 <token>（SQLite 模式下前面还有 <db>）\n", .{});
         return 2;
     }
 
     try w.print("STORE={s}\n", .{keeper.storeKind()});
-    switch (keeper.check(pos[1], now)) {
+    switch (keeper.check(pos[0], now)) {
         .active => |a| {
             defer a.deinit(gpa);
             try w.print("STATE=active\nCLIENT={s}\nPWD={s}\nAUTHORIZE=1\n", .{ a.client, a.pwd_tag });
@@ -558,11 +644,11 @@ fn sessionRevoke(
     pos: []const []const u8,
     now: i64,
 ) !u8 {
-    if (pos.len < 2) {
-        try w.print("ERROR=revoke 需要 <db> <token>\n", .{});
+    if (pos.len < 1) {
+        try w.print("ERROR=revoke 需要 <token>（SQLite 模式下前面还有 <db>）\n", .{});
         return 2;
     }
-    const ok = keeper.revoke(pos[1], now);
+    const ok = keeper.revoke(pos[0], now);
     try w.print("REVOKED={d}\n", .{@intFromBool(ok)});
     return if (ok) 0 else 1;
 }
@@ -573,11 +659,11 @@ fn sessionRevokeUser(
     pos: []const []const u8,
     now: i64,
 ) !u8 {
-    if (pos.len < 2) {
-        try w.print("ERROR=revokeuser 需要 <db> <uid>\n", .{});
+    if (pos.len < 1) {
+        try w.print("ERROR=revokeuser 需要 <uid>（SQLite 模式下前面还有 <db>）\n", .{});
         return 2;
     }
-    const uid = (try parseIntArg(w, "<uid>", pos[1])) orelse return 2;
+    const uid = (try parseIntArg(w, "<uid>", pos[0])) orelse return 2;
     const ok = keeper.revokeUser(uid, now);
     try w.print("UID={d}\nBUMPED={d}\n", .{ uid, @intFromBool(ok) });
     return if (ok) 0 else 1;
@@ -589,13 +675,13 @@ fn sessionRevokeClient(
     pos: []const []const u8,
     now: i64,
 ) !u8 {
-    if (pos.len < 3) {
-        try w.print("ERROR=revokeclient 需要 <db> <uid> <client>\n", .{});
+    if (pos.len < 2) {
+        try w.print("ERROR=revokeclient 需要 <uid> <client>（SQLite 模式下前面还有 <db>）\n", .{});
         return 2;
     }
-    const uid = (try parseIntArg(w, "<uid>", pos[1])) orelse return 2;
-    const ok = keeper.revokeClient(uid, pos[2], now);
-    try w.print("UID={d}\nCLIENT={s}\nBUMPED={d}\n", .{ uid, pos[2], @intFromBool(ok) });
+    const uid = (try parseIntArg(w, "<uid>", pos[0])) orelse return 2;
+    const ok = keeper.revokeClient(uid, pos[1], now);
+    try w.print("UID={d}\nCLIENT={s}\nBUMPED={d}\n", .{ uid, pos[1], @intFromBool(ok) });
     return if (ok) 0 else 1;
 }
 
