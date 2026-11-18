@@ -355,6 +355,8 @@ test "sqlite: 建表按模型 + 方言规则生成（非照抄 XML）且幂等" 
         } else if (std.mem.eql(u8, name, "ExpireAt")) {
             // DataType="Int64" → INTEGER
             try testing.expectEqualStrings("INTEGER", ty);
+            // DefaultValue="0" → DEFAULT 0（默认值也由方言渲染，不是原样拼 XML）
+            try testing.expectEqualStrings("0", columnText(r, "dflt_value"));
             saw_expire = true;
         }
     }
