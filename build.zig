@@ -57,6 +57,21 @@ pub fn build(b: *std.Build) void {
     guard_demo.root_module.addImport("pek_zpermissions", lib_module);
     b.installArtifact(guard_demo);
 
+    // 性能基准：会话热路径（固定 ReleaseFast —— 性能测量不能用 debug 档）
+    const bench_exe = b.addExecutable(.{
+        .name = "session-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/session_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &imports,
+        }),
+    });
+    bench_exe.root_module.addImport("pek_zpermissions", lib_module);
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "会话热路径性能基准（ReleaseFast）");
+    bench_step.dependOn(&run_bench.step);
+
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "运行单元测试（含 C# / Rust 互操作黄金样本）");
     test_step.dependOn(&run_tests.step);

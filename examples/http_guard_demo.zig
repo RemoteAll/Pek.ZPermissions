@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer app.deinit();
 
     // 鉴权中间件：注册后所有路由自动受保护（豁免前缀除外）
-    var guard = zperm.http_auth.Guard.init(io, .{ .secret = secret });
+    var guard = zperm.http_auth.Guard.init(.{ .secret = secret });
     try app.useMiddleware(guard.middleware());
 
     try app.get("/health", router.handler(health));

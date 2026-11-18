@@ -4,7 +4,7 @@
 //! 本文件就是补这一层，按 `router.Middleware` 的形态提供，注册方式：
 //!
 //! ```zig
-//! var guard = http_auth.Guard.init(io, .{ .secret = secret, .keeper = &keeper });
+//! var guard = http_auth.Guard.init(.{ .secret = secret, .keeper = &keeper });
 //! try app.router.useMiddleware(guard.middleware());
 //! ```
 //!
@@ -81,11 +81,11 @@ pub const Outcome = union(enum) {
 };
 
 pub const Guard = struct {
-    io: std.Io,
     cfg: Config,
 
-    pub fn init(io: std.Io, cfg: Config) Guard {
-        return .{ .io = io, .cfg = cfg };
+    /// 构造。**不需要 `io`**：当前时间走 `zzig.DateTime.nowUnix()`（Windows 直调 Win32）。
+    pub fn init(cfg: Config) Guard {
+        return .{ .cfg = cfg };
     }
 
     /// 转成路由中间件，供 `router.useMiddleware` / `app` 注册。
@@ -156,7 +156,7 @@ pub const Guard = struct {
         next: router.Next,
     ) anyerror!router.Response {
         const self: *Guard = @ptrCast(@alignCast(ptr orelse return next.run(c)));
-        switch (self.authorize(c, nowSeconds(self.io))) {
+        switch (self.authorize(c, nowSeconds())) {
             .allow, .anonymous => return next.run(c),
             .deny => |d| return denyResponse(c, d),
         }
@@ -182,10 +182,9 @@ fn extractToken(req: router.Request, header_name: []const u8) ?[]const u8 {
     return if (token.len == 0) null else token;
 }
 
-fn nowSeconds(io: std.Io) i64 {
-    const ts = std.Io.Clock.real.now(io);
-    const ns_per_s: i96 = std.time.ns_per_s;
-    return @intCast(@divFloor(ts.nanoseconds, ns_per_s));
+/// 当前 Unix 秒（复用 zzig，不重复造）。
+fn nowSeconds() i64 {
+    return zzig.DateTime.nowUnix();
 }
 
 // ————— 测试 —————
@@ -206,7 +205,7 @@ test "http_auth：豁免路径放行且不写状态" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var guard = Guard.init(std.testing.io, .{ .secret = try jwt.parseSecret(TEST_SECRET) });
+    var guard = Guard.init(.{ .secret = try jwt.parseSecret(TEST_SECRET) });
     var c = try testCtx(a, "/health/live", null);
 
     try std.testing.expectEqual(Outcome.anonymous, guard.authorize(&c, 1000));
@@ -218,7 +217,7 @@ test "http_auth：缺令牌 / 非 Bearer / 坏签名 / 过期 一律 401" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var guard = Guard.init(std.testing.io, .{ .secret = try jwt.parseSecret(TEST_SECRET) });
+    var guard = Guard.init(.{ .secret = try jwt.parseSecret(TEST_SECRET) });
 
     // 缺令牌
     {
@@ -257,7 +256,7 @@ test "http_auth：验签通过 → allow 且写入 auth.uid；scheme 大小写�
     defer arena.deinit();
     const a = arena.allocator();
 
-    var guard = Guard.init(std.testing.io, .{ .secret = try jwt.parseSecret(TEST_SECRET) });
+    var guard = Guard.init(.{ .secret = try jwt.parseSecret(TEST_SECRET) });
 
     var b = try jwt.Builder.fromSecret(TEST_SECRET);
     const token = try b.encodeVerbatim(a, "{\"sub\":\"42\"}");
@@ -278,7 +277,7 @@ test "http_auth：会话被踢线 → 403；存储不可用（untracked）→ �
     // ① 没有存储 → untracked → 放行（硬口径）
     {
         var keeper = session.Keeper.init(a, null, "", .{});
-        var guard = Guard.init(std.testing.io, .{
+        var guard = Guard.init(.{
             .secret = try jwt.parseSecret(TEST_SECRET),
             .keeper = &keeper,
         });
@@ -295,7 +294,7 @@ test "http_auth：会话被踢线 → 403；存储不可用（untracked）→ �
         var keeper = session.Keeper.init(a, store, "", .{});
         try std.testing.expect(keeper.register(token, 42, "pwd-tag", "web", 1000));
 
-        var guard = Guard.init(std.testing.io, .{
+        var guard = Guard.init(.{
             .secret = try jwt.parseSecret(TEST_SECRET),
             .keeper = &keeper,
         });

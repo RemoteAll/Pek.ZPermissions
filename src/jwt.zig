@@ -23,6 +23,7 @@
 //! 不依赖键序。需要绝对字节一致的对拍场景请使用 `encodeVerbatim`（原样签名）。
 
 const std = @import("std");
+const zzig = @import("zzig");
 const secret_mod = @import("secret.zig");
 
 pub const Secret = secret_mod.Secret;
@@ -182,7 +183,7 @@ pub const Builder = struct {
             return error.OutOfMemory;
         const expect = hmacSha256(self.key, signed_data, "");
         const given = base64DecodeLenient(a, segs[2]) catch return error.SignatureDecode;
-        if (!fixedTimeEq(expect[0..], given)) return error.SignatureMismatch;
+        if (!zzig.hash.constantTimeEql(expect[0..], given)) return error.SignatureMismatch;
 
         // 签名段必须是规范形态（URL 安全、无填充、无空白）
         const canonical = base64UrlNoPad(a, given[0..]) catch return error.OutOfMemory;
@@ -494,13 +495,6 @@ fn base64DecodeLenient(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     const out = try arena.alloc(u8, size);
     try dec.decode(out, padded);
     return out;
-}
-
-fn fixedTimeEq(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var diff: u8 = 0;
-    for (a, b) |x, y| diff |= x ^ y;
-    return diff == 0;
 }
 
 fn jsonToInt(v: std.json.Value) ?i64 {

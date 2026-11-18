@@ -26,6 +26,7 @@ const sqlite_store = @import("sqlite_store.zig");
 const model_guard = @import("model_guard.zig");
 const redis_store = @import("redis_store.zig");
 const zcode = @import("zcode");
+const zzig = @import("zzig");
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -72,7 +73,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (std.mem.eql(u8, cmd, "gen")) return cmdGen(io, gpa, w, args.items[3..], false);
     if (std.mem.eql(u8, cmd, "genraw")) return cmdGen(io, gpa, w, args.items[3..], true);
-    if (std.mem.eql(u8, cmd, "verify")) return cmdVerify(io, gpa, w, args.items[3..]);
+    if (std.mem.eql(u8, cmd, "verify")) return cmdVerify(gpa, w, args.items[3..]);
     if (std.mem.eql(u8, cmd, "inspect")) return cmdInspect(gpa, w, args.items[3..]);
     if (std.mem.eql(u8, cmd, "selfcheck")) return cmdSelfCheck(gpa, w);
 
@@ -113,10 +114,9 @@ fn usage(w: *std.Io.Writer) !void {
     , .{});
 }
 
-fn nowSeconds(io: std.Io) i64 {
-    const ts = std.Io.Clock.real.now(io);
-    const ns_per_s: i96 = std.time.ns_per_s;
-    return @intCast(@divFloor(ts.nanoseconds, ns_per_s));
+/// 当前 Unix 秒（复用 zzig：Windows 直调 Win32，不依赖 `io`）。
+fn nowSeconds() i64 {
+    return zzig.DateTime.nowUnix();
 }
 
 fn loadPayload(io: std.Io, gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -175,7 +175,7 @@ fn cmdGen(
     };
     defer gpa.free(payload_json);
 
-    const now = nowSeconds(io);
+    const now = nowSeconds();
 
     var builder = jwt.Builder{
         .key = parsed.key,
@@ -213,7 +213,6 @@ fn cmdGen(
 }
 
 fn cmdVerify(
-    io: std.Io,
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
     params: []const []const u8,
@@ -229,7 +228,7 @@ fn cmdVerify(
     };
 
     var builder = jwt.Builder{ .key = parsed.key, .algorithm = parsed.algorithm };
-    var decoded = builder.validate(gpa, params[1], nowSeconds(io)) catch |e| {
+    var decoded = builder.validate(gpa, params[1], nowSeconds()) catch |e| {
         try w.print("RESULT=FAIL\nMESSAGE={s}\n", .{jwt.message(e)});
         return 1;
     };
@@ -564,7 +563,7 @@ fn cmdSession(
     }
 
     const keeper = session_mod.Keeper.init(gpa, store, prefix, policy);
-    const now = nowSeconds(io);
+    const now = nowSeconds();
 
     if (std.mem.eql(u8, cmd, "register")) {
         return sessionRegister(w, &keeper, pos.items, client_name, pwd_tag, now);
